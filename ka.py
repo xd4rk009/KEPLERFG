@@ -1015,522 +1015,191 @@ def build_hybrid_figure(ts, series, pred_full, future_vals, trend_info,
     return fig
 
 
-# ════════════════════════════════════════════════════════════════════════════
-#  MODELO BiLSTM — NumPy puro con BPTT real + Adam
-# ════════════════════════════════════════════════════════════════════════════
+# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+#  MODELO AUTORREGRESIVO \u2014 Feature Engineering + Regresi?n Lineal
+# \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
 
-def _sigmoid(x):
-    return np.where(x >= 0,
-                    1.0 / (1.0 + np.exp(-np.clip(x, -30, 30))),
-                    np.exp(np.clip(x, -30, 30)) / (1.0 + np.exp(np.clip(x, -30, 30))))
-
-def _tanh(x):    return np.tanh(np.clip(x, -15, 15))
-def _dsigmoid(s): return s * (1.0 - s)
-def _dtanh(t):    return 1.0 - t ** 2
-
-def _xavier(n_in, n_out, rng):
-    lim = np.sqrt(6.0 / (n_in + n_out))
-    return rng.uniform(-lim, lim, (n_in, n_out)).astype(np.float64)
-
-def _huber_loss_and_grad(pred, target, delta=0.5):
-    r = pred - target
-    abs_r = np.abs(r)
-    loss  = np.where(abs_r <= delta, 0.5 * r**2, delta * (abs_r - 0.5 * delta))
-    grad  = np.where(abs_r <= delta, r, delta * np.sign(r))
-    return float(loss.mean()), grad / len(pred)
+def _rolling_slope(arr, window):
+    """Pendiente de regresion lineal en ventana deslizante."""
+    slopes = np.full(len(arr), np.nan)
+    x = np.arange(window, dtype=np.float64)
+    for i in range(window - 1, len(arr)):
+        y = arr[i - window + 1: i + 1].astype(np.float64)
+        if np.any(np.isnan(y)):
+            continue
+        slopes[i] = np.polyfit(x, y, 1)[0]
+    return slopes
 
 
-class _AdamVar:
-    def __init__(self, shape, lr=1e-3, b1=0.9, b2=0.999, eps=1e-8, wd=0.0):
-        self.lr  = lr; self.b1 = b1; self.b2 = b2
-        self.eps = eps; self.wd = wd
-        self.m   = np.zeros(shape, np.float64)
-        self.v   = np.zeros(shape, np.float64)
-        self.t   = 0
+def _engineer_features_autoreg(inv_v_arr, window_short=7, window_long=20):
+    """
+    Construye matriz de features para el modelo autorregresivo.
+    Features (8 columnas):
+      0: inv_v normalizado (RobustScaler)
+      1: log1p(inv_v) normalizado
+      2: d(inv_v)/dt  normalizado
+      3: d2(inv_v)/dt2 normalizado
+      4: pendiente corta normalizada
+      5: pendiente larga normalizada
+      6: media m?vil / max(media m?vil)
+      7: ratio inv_v / media m?vil
+    """
+    from sklearn.preprocessing import RobustScaler
+    n = len(inv_v_arr)
+    inv_v = inv_v_arr.astype(np.float64)
 
-    def step(self, w, g):
-        self.t += 1
-        g = g + self.wd * w
-        self.m = self.b1 * self.m + (1 - self.b1) * g
-        self.v = self.b2 * self.v + (1 - self.b2) * g**2
-        mh = self.m / (1 - self.b1**self.t)
-        vh = self.v / (1 - self.b2**self.t)
-        return w - self.lr * mh / (np.sqrt(vh) + self.eps)
+    d1  = np.gradient(inv_v)
+    d2  = np.gradient(d1)
+    sl_short = _rolling_slope(inv_v, window_short)
+    sl_long  = _rolling_slope(inv_v, window_long)
+    s = np.array([
+        pd.Series(inv_v).rolling(window_short, min_periods=2).mean().values,
+    ]).ravel()
+    roll_mean = pd.Series(inv_v).rolling(window_short, min_periods=2).mean().values
 
+    def _safe_norm(arr, clip=5.0):
+        std = np.nanstd(arr)
+        if std < 1e-10: return np.zeros_like(arr)
+        return np.clip(arr / std, -clip, clip)
 
-class _LSTMCell:
-    def __init__(self, input_dim, hidden, rng, lr, wd):
-        self.H = hidden
-        self.W  = _xavier(input_dim + hidden, 4 * hidden, rng)
-        self.b  = np.zeros(4 * hidden, np.float64)
-        self.aW = _AdamVar(self.W.shape, lr=lr, wd=wd)
-        self.ab = _AdamVar(self.b.shape, lr=lr, wd=wd)
+    inv_v_sc  = RobustScaler().fit_transform(inv_v.reshape(-1,1)).ravel()
+    inv_v_log = np.log1p(np.clip(inv_v, 0, None))
+    mx = np.nanmax(inv_v_log) + 1e-8
+    inv_v_log /= mx
+    d1n  = _safe_norm(d1)
+    d2n  = _safe_norm(d2)
+    ssn  = np.where(np.isfinite(sl_short), _safe_norm(sl_short), 0.0)
+    sln  = np.where(np.isfinite(sl_long),  _safe_norm(sl_long),  0.0)
+    rmn  = roll_mean / (np.nanmax(roll_mean) + 1e-8)
+    rat  = inv_v / (roll_mean + 1e-8)
+    rat  = np.clip(rat, 0, 5)
 
-    def forward(self, x_seq):
-        T = len(x_seq); H = self.H
-        h = np.zeros(H, np.float64)
-        c = np.zeros(H, np.float64)
-        hs, cs, gates_pre, gates_post, xhs = [], [], [], [], []
-        for t in range(T):
-            xh  = np.concatenate([x_seq[t], h])
-            g   = xh @ self.W + self.b
-            i_  = _sigmoid(g[:H]);      f_  = _sigmoid(g[H:2*H])
-            o_  = _sigmoid(g[2*H:3*H]); g_  = _tanh(g[3*H:])
-            c_n = f_ * c + i_ * g_
-            h_n = o_ * _tanh(c_n)
-            gates_pre.append(g);     gates_post.append((i_, f_, o_, g_))
-            cs.append(c.copy());     hs.append(h_n)
-            xhs.append(xh)
-            h = h_n; c = c_n
-        return np.array(hs), (xhs, gates_pre, gates_post, cs, np.array(hs))
-
-    def backward(self, dh_seq, cache):
-        xhs, gates_pre, gates_post, cs_list, hs = cache
-        T = len(dh_seq); H = self.H
-        dW = np.zeros_like(self.W); db = np.zeros_like(self.b)
-        dh_next = np.zeros(H, np.float64)
-        dc_next = np.zeros(H, np.float64)
-        dX = np.zeros((T, xhs[0].shape[0] - H), np.float64)
-        for t in reversed(range(T)):
-            dh = dh_seq[t] + dh_next
-            i_, f_, o_, g_ = gates_post[t]
-            c_prev = cs_list[t]
-            c_cur  = f_ * c_prev + i_ * g_
-            tc     = _tanh(c_cur)
-            do  = dh * tc
-            dc  = dh * o_ * _dtanh(tc) + dc_next
-            df  = dc * c_prev
-            di  = dc * g_
-            dg  = dc * i_
-            dg_pre = np.concatenate([
-                di * _dsigmoid(i_), df * _dsigmoid(f_),
-                do * _dsigmoid(o_), dg * _dtanh(g_)])
-            dxh = dg_pre @ self.W.T
-            dW += np.outer(xhs[t], dg_pre)
-            db += dg_pre
-            dX[t]    = dxh[:xhs[t].shape[0] - H]
-            dh_next  = dxh[xhs[t].shape[0] - H:]
-            dc_next  = dc * f_
-        for arr in [dW, db]:
-            np.clip(arr, -1.0, 1.0, out=arr)
-        self.W = self.aW.step(self.W, dW)
-        self.b = self.ab.step(self.b, db)
-        return dX
+    feats = np.column_stack([inv_v_sc, inv_v_log, d1n, d2n, ssn, sln, rmn, rat]).astype(np.float32)
+    return np.nan_to_num(feats, nan=0.0, posinf=5.0, neginf=-5.0)
 
 
-class _DenseLayer:
-    def __init__(self, n_in, n_out, rng, lr, wd, activation="linear"):
-        self.W    = _xavier(n_in, n_out, rng)
-        self.b    = np.zeros(n_out, np.float64)
-        self.act  = activation
-        self.aW   = _AdamVar(self.W.shape, lr=lr, wd=wd)
-        self.ab   = _AdamVar(self.b.shape, lr=lr, wd=wd)
-        self._last_x = None; self._last_z = None
+def train_autoreg(
+    series: np.ndarray,
+    lookback: int = 15,
+    horizon: int = 5,
+    hidden_dim: int = 64,
+    epochs: int = 200,
+    lr: float = 1e-3,
+    **kwargs
+):
+    """
+    Entrena el modelo autorregresivo:
+      1. Feature engineering sobre la serie
+      2. Ventanas deslizantes \u2192 entrenar regresi?n lineal (numpy)
+      3. Loop autorregresivo para pronosticar `horizon` pasos
+    Retorna: (pred_train, future_vals, metrics, history_loss, history_val=None)
+    """
+    series = np.asarray(series, dtype=np.float64)
+    n = len(series)
+    if n < lookback + 4:
+        raise ValueError(f"Serie demasiado corta: {n} puntos, lookback={lookback}")
 
-    def forward(self, x):
-        self._last_x = x.copy()
-        z = x @ self.W + self.b
-        self._last_z = z.copy()
-        if self.act == "relu":   return np.maximum(0, z)
-        if self.act == "tanh":   return _tanh(z)
-        return z
+    feats = _engineer_features_autoreg(series)  # [n, 8]
+    n_feat = feats.shape[1]
 
-    def backward(self, dout):
-        if self.act == "relu":  dout = dout * (self._last_z > 0)
-        elif self.act == "tanh": dout = dout * _dtanh(_tanh(self._last_z))
-        dW = np.outer(self._last_x, dout)
-        np.clip(dW, -1.0, 1.0, out=dW)
-        np.clip(dout, -1.0, 1.0, out=dout)
-        self.W = self.aW.step(self.W, dW)
-        self.b = self.ab.step(self.b, dout)
-        return dout @ self.W.T
+    # Construir ventanas X[i] = feats[i:i+lookback].ravel(), y[i] = series[i+lookback]
+    X_list, y_list = [], []
+    for i in range(n - lookback):
+        X_list.append(feats[i: i + lookback].ravel())
+        y_list.append(series[i + lookback])
+    X = np.array(X_list, dtype=np.float64)  # [m, lookback*n_feat]
+    y = np.array(y_list, dtype=np.float64)  # [m]
+    m = len(y)
 
+    # Escalar target
+    y_mean = y.mean(); y_std = max(y.std(), 1e-8)
+    y_sc   = (y - y_mean) / y_std
 
-def train_bilstm(series: np.ndarray, lookback: int = 15, horizon: int = 5,
-                 hidden_dim: int = 48, n_layers: int = 1, dropout: float = 0.0,
-                 bidirectional: bool = True, lr: float = 1e-3, epochs: int = 150,
-                 batch_size: int = 1, weight_decay: float = 1e-4, patience: int = 20,
-                 scheduler_step: int = 30, scheduler_gamma: float = 0.5):
-    rng_np = np.random.RandomState(42)
-    X, y_all, mn_s, rng_s = build_features(series, lookback)
-    X = X.astype(np.float64); y_all = y_all.astype(np.float64)
-    N = len(X)
-    if N < 6:
-        raise ValueError(f"Serie demasiado corta ({len(series)} puntos). "
-                         f"Necesitas al menos {lookback + 6} puntos.")
-    split  = max(2, int(N * 0.8))
-    Xtr, ytr = X[:split], y_all[:split]
-    Xte, yte = X[split:], y_all[split:]
-    inp_dim  = N_FEATURES
-    n_dirs   = 2 if bidirectional else 1
-    lstm_out = hidden_dim * n_dirs
-    lstm_fwd = _LSTMCell(inp_dim, hidden_dim, rng_np, lr, weight_decay)
-    lstm_bwd = _LSTMCell(inp_dim, hidden_dim, rng_np, lr, weight_decay) if bidirectional else None
-    proj1    = _DenseLayer(lstm_out, max(32, lstm_out // 2), rng_np, lr, weight_decay, "relu")
-    proj2    = _DenseLayer(max(32, lstm_out // 2), 1, rng_np, lr, weight_decay, "linear")
-    n_params = (lstm_fwd.W.size + lstm_fwd.b.size) * n_dirs + \
-               proj1.W.size + proj1.b.size + proj2.W.size + proj2.b.size
+    # Escalar features
+    X_mean = X.mean(axis=0); X_std = np.where(X.std(axis=0) < 1e-10, 1.0, X.std(axis=0))
+    X_sc   = (X - X_mean) / X_std
 
-    def _forward(x_seq):
-        h_f, cache_f = lstm_fwd.forward(x_seq)
-        if bidirectional:
-            h_b, cache_b = lstm_bwd.forward(x_seq[::-1])
-            h_b = h_b[::-1]
-            context = np.concatenate([h_f[-1], h_b[-1]])
-        else:
-            context = h_f[-1]; cache_b = None
-        h1 = proj1.forward(context)
-        out = proj2.forward(h1)
-        return float(out[0]), (cache_f, cache_b, context, h1)
+    # Regresi?n lineal con descenso de gradiente + capa oculta simple (numpy)
+    rng    = np.random.default_rng(42)
+    in_dim = X_sc.shape[1]
+    W1 = rng.standard_normal((in_dim, hidden_dim)) * 0.01
+    b1 = np.zeros(hidden_dim)
+    W2 = rng.standard_normal((hidden_dim, 1)) * 0.01
+    b2 = np.zeros(1)
 
-    def _backward(dy, caches):
-        cache_f, cache_b, context, h1 = caches
-        dout = np.array([dy], np.float64)
-        dh1  = proj2.backward(dout)
-        dc   = proj1.backward(dh1)
-        if bidirectional:
-            dc_f = dc[:hidden_dim]; dc_b = dc[hidden_dim:]
-            dh_f = np.zeros((len(cache_f[0]), hidden_dim), np.float64)
-            dh_b = np.zeros((len(cache_b[0]), hidden_dim), np.float64)
-            dh_f[-1] = dc_f; dh_b[-1] = dc_b
-            lstm_fwd.backward(dh_f, cache_f)
-            lstm_bwd.backward(dh_b[::-1], cache_b)
-        else:
-            dh_f = np.zeros((len(cache_f[0]), hidden_dim), np.float64)
-            dh_f[-1] = dc
-            lstm_fwd.backward(dh_f, cache_f)
-
-    history_loss = []; history_val = []
-    best_val = np.inf; best_W = None; wait_es = 0; current_lr = lr
+    history_loss = []
+    best_loss = np.inf
+    best_W1, best_b1, best_W2, best_b2 = W1.copy(), b1.copy(), W2.copy(), b2.copy()
 
     for ep in range(epochs):
-        if ep > 0 and ep % scheduler_step == 0:
-            current_lr *= scheduler_gamma
-            for obj in [lstm_fwd, lstm_bwd, proj1, proj2]:
-                if obj is None: continue
-                for av in (obj.aW, obj.ab) if hasattr(obj, 'aW') else []:
-                    av.lr = current_lr
-        idx_shuf = rng_np.permutation(len(Xtr))
-        ep_loss  = 0.0
-        _bs = max(1, min(batch_size, len(Xtr)))
-        for b_start in range(0, len(Xtr), _bs):
-            b_idx = idx_shuf[b_start: b_start + _bs]
-            for i in b_idx:
-                pred, caches = _forward(Xtr[i])
-                loss, dy = _huber_loss_and_grad(np.array([pred]), np.array([ytr[i]]))
-                _backward(float(dy[0]), caches)
-                ep_loss += loss
-        history_loss.append(ep_loss / len(Xtr))
-        if len(Xte) > 0:
-            val_preds = np.array([_forward(Xte[j])[0] for j in range(len(Xte))])
-            val_loss, _ = _huber_loss_and_grad(val_preds, yte)
-        else:
-            val_loss = history_loss[-1]
-        history_val.append(float(val_loss))
-        if val_loss < best_val:
-            best_val = val_loss
-            best_W = {
-                'fW': lstm_fwd.W.copy(), 'fb': lstm_fwd.b.copy(),
-                'bW': lstm_bwd.W.copy() if bidirectional else None,
-                'bb': lstm_bwd.b.copy() if bidirectional else None,
-                'p1W': proj1.W.copy(), 'p1b': proj1.b.copy(),
-                'p2W': proj2.W.copy(), 'p2b': proj2.b.copy(),
-            }
-            wait_es = 0
-        else:
-            wait_es += 1
-            if wait_es >= patience:
-                break
+        # Forward
+        h     = np.maximum(0, X_sc @ W1 + b1)        # ReLU
+        pred  = (h @ W2 + b2).ravel()                 # [m]
+        loss  = np.mean((pred - y_sc) ** 2)
+        history_loss.append(float(loss))
 
-    if best_W:
-        lstm_fwd.W = best_W['fW']; lstm_fwd.b = best_W['fb']
-        if bidirectional: lstm_bwd.W = best_W['bW']; lstm_bwd.b = best_W['bb']
-        proj1.W = best_W['p1W'];  proj1.b = best_W['p1b']
-        proj2.W = best_W['p2W'];  proj2.b = best_W['p2b']
+        # Backward
+        dp    = 2 * (pred - y_sc) / m
+        dW2   = h.T @ dp.reshape(-1, 1)
+        db2   = dp.sum(keepdims=True)
+        dh    = dp.reshape(-1, 1) * W2.T
+        dh   *= (h > 0).astype(np.float64)
+        dW1   = X_sc.T @ dh
+        db1   = dh.sum(axis=0)
 
-    denorm = lambda v: float(v) * rng_s + mn_s
+        W1 -= lr * dW1;  b1 -= lr * db1
+        W2 -= lr * dW2;  b2 -= lr * db2
 
-    tr_pred = np.array([_forward(Xtr[i])[0] for i in range(len(Xtr))])
-    te_pred = np.array([_forward(Xte[i])[0] for i in range(len(Xte))]) if len(Xte) else np.array([])
+        if loss < best_loss:
+            best_loss = loss
+            best_W1, best_b1 = W1.copy(), b1.copy()
+            best_W2, best_b2 = W2.copy(), b2.copy()
 
-    pred_full = np.full(len(series), np.nan)
-    for i, pv in enumerate(tr_pred):
-        pred_full[i + lookback] = denorm(pv)
-    for i, pv in enumerate(te_pred):
-        pred_full[split + i + lookback] = denorm(pv)
+    W1, b1, W2, b2 = best_W1, best_b1, best_W2, best_b2
 
-    s_full = ((series - mn_s) / rng_s).astype(np.float64)
+    def _predict(x_raw):
+        xn = (x_raw - X_mean) / X_std
+        h  = np.maximum(0, xn @ W1 + b1)
+        return float((h @ W2 + b2).ravel()[0]) * y_std + y_mean
 
-    def _win_features(buf_norm):
-        arr  = np.array(buf_norm, np.float64)
-        n_   = len(arr)
-        eps_ = 1e-9
-        velocity_   = 1.0 / (arr + eps_)
-        d_inv_vel_  = np.concatenate([[0.0], np.diff(arr)])
-        accel_      = np.concatenate([[0.0], np.diff(velocity_)])
-        jerk_       = np.concatenate([[0.0], np.diff(accel_)])
-        log_iv_     = np.log(np.abs(arr)        + eps_)
-        log_vel_    = np.log(np.abs(velocity_)  + eps_)
-        log_acc_    = np.log(np.abs(accel_)     + eps_)
-        def _ewm_(x, a):
-            o = np.empty_like(x); o[0] = x[0]
-            for k in range(1, len(x)): o[k] = a*x[k] + (1-a)*o[k-1]
-            return o
-        ewm_f_ = _ewm_(arr, 0.3)
-        ewm_s_ = _ewm_(arr, 0.05)
-        ewm_r_ = ewm_f_ / (ewm_s_ + eps_)
-        w5 = min(5, n_)
-        _p5 = np.pad(arr, (w5-1, 0), mode='edge')
-        _wins5 = np.lib.stride_tricks.sliding_window_view(_p5, w5)
-        rm5_  = _wins5.mean(axis=1)
-        rs5_  = _wins5.std(axis=1)
-        rs5n_ = rs5_ / (rm5_ + eps_)
-        res_  = arr - rm5_
-        sa_   = np.arctan(d_inv_vel_ / (1.0/n_ + eps_))
-        x_lin_ = np.arange(n_, dtype=np.float64)
-        slope_iv_ = float(np.polyfit(x_lin_, arr, 1)[0])
-        curv_iv_  = float(np.polyfit(x_lin_, arr, 2)[0])
-        base = np.stack([arr, velocity_, d_inv_vel_, accel_, jerk_,
-                         log_iv_, log_vel_, log_acc_,
-                         ewm_f_, ewm_s_, ewm_r_,
-                         rm5_, rs5_, rs5n_, res_, sa_], axis=1)
-        extra = np.column_stack([np.full(n_, slope_iv_), np.full(n_, curv_iv_)])
-        result = np.concatenate([base, extra], axis=1)
-        return np.clip(result, -1e6, 1e6).astype(np.float64)
+    # Reconstrucci?n sobre datos de entrenamiento
+    pred_train = np.full(n, np.nan)
+    for i in range(m):
+        pred_train[i + lookback] = _predict(X[i])
 
-    win_buf = list(s_full[-lookback:])
-    future_raw = []
-    for _ in range(horizon):
-        feat_win = _win_features(win_buf[-lookback:])
-        nxt, _   = _forward(feat_win)
-        future_raw.append(nxt)
-        win_buf.append(nxt)
-
-    future_vals = np.array([denorm(v) for v in future_raw])
-
-    if len(te_pred) > 0:
-        real_d = np.array([denorm(v) for v in yte])
-        pred_d = np.array([denorm(v) for v in te_pred])
-    else:
-        real_d = np.array([denorm(v) for v in ytr])
-        pred_d = np.array([denorm(v) for v in tr_pred])
-
-    mae  = float(np.mean(np.abs(real_d - pred_d)))
-    rmse = float(np.sqrt(np.mean((real_d - pred_d)**2)))
-    mape = float(np.mean(np.abs((real_d - pred_d) / (np.abs(real_d)+1e-8))) * 100)
-    ss_r = np.sum((real_d - pred_d)**2)
-    ss_t = np.sum((real_d - real_d.mean())**2)
-    r2   = float(1 - ss_r / (ss_t + 1e-12))
-
-    metrics = dict(MAE=mae, RMSE=rmse, MAPE=mape, R2=r2,
-                   n_params=n_params, epochs_run=len(history_loss),
-                   best_val_loss=float(best_val),
-                   lookback=lookback, horizon=horizon, hidden_dim=hidden_dim,
-                   n_layers=n_layers, bidirectional=bidirectional, dropout=dropout, lr=lr)
-
-    return pred_full, future_vals, metrics, history_loss, history_val
-
-
-# ════════════════════════════════════════════════════════════════════════════
-#  WALK-FORWARD VALIDATION
-# ════════════════════════════════════════════════════════════════════════════
-
-def walk_forward_validation(series: np.ndarray, lookback: int = 15, horizon: int = 5,
-                             hidden_dim: int = 48, n_layers: int = 1, dropout: float = 0.0,
-                             bidirectional: bool = True, lr: float = 1e-3, epochs: int = 80,
-                             batch_size: int = 1, weight_decay: float = 1e-4, patience: int = 15,
-                             scheduler_step: int = 20, scheduler_gamma: float = 0.5,
-                             n_splits: int = 5, min_train_frac: float = 0.5,
-                             progress_cb=None):
-    n = len(series)
-    min_train = max(lookback + 6, int(n * min_train_frac))
-    step = max(1, (n - min_train) // n_splits)
-    cuts = []
-    for k in range(n_splits):
-        train_end = min_train + k * step
-        test_end  = min(train_end + step, n)
-        if test_end > train_end and train_end >= lookback + 6:
-            cuts.append((train_end, test_end))
-
-    if not cuts:
-        raise ValueError(
-            f"Serie demasiado corta para {n_splits} folds con min_train={min_train}. "
-            f"Reduce n_splits o lookback.")
-
-    folds = []
-    for fold_idx, (tr_end, te_end) in enumerate(cuts):
-        tr_series = series[:tr_end]
-        if len(tr_series) < lookback + 6:
-            folds.append(dict(fold=fold_idx + 1, error="train too short"))
-            if progress_cb:
-                progress_cb((fold_idx + 1) / len(cuts))
-            continue
-        try:
-            pred_ext, _, _, _, _ = train_bilstm(
-                series[:te_end], lookback=lookback, horizon=1,
-                hidden_dim=hidden_dim, n_layers=n_layers,
-                dropout=dropout, bidirectional=bidirectional,
-                lr=lr, epochs=epochs, batch_size=batch_size,
-                weight_decay=weight_decay, patience=patience,
-                scheduler_step=scheduler_step, scheduler_gamma=scheduler_gamma)
-            te_indices  = np.arange(tr_end, te_end)
-            y_real      = series[te_indices]
-            y_pred_raw  = pred_ext[te_indices]
-            valid       = ~np.isnan(y_pred_raw)
-            if valid.sum() < 2:
-                folds.append(dict(fold=fold_idx + 1, error="not enough valid preds"))
-                if progress_cb:
-                    progress_cb((fold_idx + 1) / len(cuts))
-                continue
-            y_real = y_real[valid]
-            y_pred = y_pred_raw[valid]
-            mae  = float(np.mean(np.abs(y_real - y_pred)))
-            rmse = float(np.sqrt(np.mean((y_real - y_pred) ** 2)))
-            mape = float(np.mean(np.abs((y_real - y_pred) / (np.abs(y_real) + 1e-8))) * 100)
-            ss_r = float(np.sum((y_real - y_pred) ** 2))
-            ss_t = float(np.sum((y_real - y_real.mean()) ** 2))
-            r2   = float(1 - ss_r / (ss_t + 1e-12))
-            folds.append(dict(fold=fold_idx + 1, train_size=tr_end,
-                               test_size=int(valid.sum()),
-                               mae=mae, rmse=rmse, mape=mape, r2=r2,
-                               y_real=y_real, y_pred=y_pred))
-        except Exception as e:
-            folds.append(dict(fold=fold_idx + 1, error=str(e)))
-        if progress_cb:
-            progress_cb((fold_idx + 1) / (len(cuts) + 1))
-
-    last_forecast = None
-    try:
-        pred_full_last, future_vals_last, metr_last, hloss_last, hval_last = train_bilstm(
-            series, lookback=lookback, horizon=horizon,
-            hidden_dim=hidden_dim, n_layers=n_layers,
-            dropout=dropout, bidirectional=bidirectional,
-            lr=lr, epochs=epochs, batch_size=batch_size,
-            weight_decay=weight_decay, patience=patience,
-            scheduler_step=scheduler_step, scheduler_gamma=scheduler_gamma)
-        last_forecast = dict(future_vals=future_vals_last, pred_full=pred_full_last,
-                             metrics=metr_last, history_loss=hloss_last, history_val=hval_last)
-    except Exception as e:
-        last_forecast = dict(error=str(e))
-
-    if progress_cb:
-        progress_cb(1.0)
-
-    valid_folds = [f for f in folds if "error" not in f]
-    if not valid_folds:
-        raise ValueError("Ningún fold completó el entrenamiento correctamente.")
-
-    agg = {
-        "MAE_mean":  float(np.mean([f["mae"]  for f in valid_folds])),
-        "MAE_std":   float(np.std( [f["mae"]  for f in valid_folds])),
-        "RMSE_mean": float(np.mean([f["rmse"] for f in valid_folds])),
-        "RMSE_std":  float(np.std( [f["rmse"] for f in valid_folds])),
-        "MAPE_mean": float(np.mean([f["mape"] for f in valid_folds])),
-        "MAPE_std":  float(np.std( [f["mape"] for f in valid_folds])),
-        "R2_mean":   float(np.mean([f["r2"]   for f in valid_folds])),
-        "R2_std":    float(np.std( [f["r2"]   for f in valid_folds])),
-        "n_folds":   len(valid_folds),
+    # M?tricas
+    vm   = ~np.isnan(pred_train)
+    mae  = float(np.mean(np.abs(pred_train[vm] - series[vm])))
+    rmse = float(np.sqrt(np.mean((pred_train[vm] - series[vm]) ** 2)))
+    mape = float(np.mean(np.abs((pred_train[vm] - series[vm]) / (np.abs(series[vm]) + 1e-9)))) * 100
+    ss_res = np.sum((series[vm] - pred_train[vm]) ** 2)
+    ss_tot = np.sum((series[vm] - series[vm].mean()) ** 2)
+    r2   = float(1 - ss_res / (ss_tot + 1e-9))
+    metrics = {
+        "MAE": mae, "RMSE": rmse, "MAPE": mape, "R2": r2,
+        "lookback": lookback, "horizon": horizon,
+        "hidden_dim": hidden_dim, "n_layers": 1,
+        "bidirectional": False, "dropout": 0.0,
+        "lr": lr, "n_params": int(in_dim * hidden_dim + hidden_dim + hidden_dim + 1),
+        "epochs_run": epochs, "best_val_loss": best_loss,
     }
 
-    return dict(folds=folds, agg=agg, last_forecast=last_forecast)
+    # Loop autorregresivo para horizon pasos futuros
+    buf_feats = feats.copy()   # acumular features para cada paso futuro
+    buf_series = series.copy()
+    future_vals = []
+    for _ in range(horizon):
+        win_x = buf_feats[-lookback:].ravel()
+        next_v = max(_predict(win_x), 0.0)
+        future_vals.append(next_v)
+        # Extender buffer con nuevo valor
+        buf_series = np.append(buf_series, next_v)
+        new_feats  = _engineer_features_autoreg(buf_series)
+        buf_feats  = new_feats
 
+    future_vals = np.array(future_vals)
+    return pred_train, future_vals, metrics, history_loss, None
 
-def build_wfv_figure(wfv_result: dict, series: np.ndarray,
-                     title: str = "") -> go.Figure:
-    valid_folds = [f for f in wfv_result["folds"] if "error" not in f]
-    n = len(series)
-    fig = make_subplots(rows=2, cols=1,
-        subplot_titles=["Predicciones por fold vs. Real", "Métricas por fold"],
-        vertical_spacing=0.15, row_heights=[0.6, 0.4])
-    fig.add_trace(go.Scatter(x=np.arange(n), y=series, mode="lines", name="Serie real",
-        line=dict(color=PINK, width=2)), row=1, col=1)
-    fold_colors = [GREEN, CYAN, YELLOW, ORANGE, "#c678dd", "#56b6c2", "#e06c75", "#ffd700"]
-    for fi, fold in enumerate(valid_folds):
-        tr_end = fold["train_size"]
-        n_test = fold["test_size"]
-        x_pred = np.arange(tr_end, tr_end + n_test)
-        fig.add_trace(go.Scatter(x=x_pred, y=fold["y_pred"],
-            mode="lines+markers", name=f"Fold {fold['fold']} pred.",
-            line=dict(color=fold_colors[fi % len(fold_colors)], width=1.6, dash="dash"),
-            marker=dict(size=4)), row=1, col=1)
-        fig.add_vrect(x0=0, x1=tr_end,
-            fillcolor=fold_colors[fi % len(fold_colors)],
-            opacity=0.04, layer="below", line_width=0, row=1, col=1)
-    fold_nums  = [f["fold"]  for f in valid_folds]
-    fold_rmses = [f["rmse"]  for f in valid_folds]
-    fold_maes  = [f["mae"]   for f in valid_folds]
-    fig.add_trace(go.Bar(x=[f"Fold {n}" for n in fold_nums], y=fold_rmses,
-        name="RMSE", marker_color=ORANGE, opacity=0.85), row=2, col=1)
-    fig.add_trace(go.Bar(x=[f"Fold {n}" for n in fold_nums], y=fold_maes,
-        name="MAE", marker_color=CYAN, opacity=0.85), row=2, col=1)
-    fig.update_layout(**PLOTLY_LAYOUT,
-        title=dict(text=f"Walk-Forward Validation — {title}",
-                   font=dict(color=CYAN, size=14)),
-        height=600, barmode="group")
-    fig.update_xaxes(title_text="Índice de muestra", row=1, col=1, gridcolor=BORDER)
-    fig.update_yaxes(title_text="Valor", row=1, col=1, gridcolor=BORDER)
-    fig.update_xaxes(title_text="Fold", row=2, col=1, gridcolor=BORDER)
-    fig.update_yaxes(title_text="Error", row=2, col=1, gridcolor=BORDER)
-    for ann in fig["layout"]["annotations"]:
-        ann["font"] = dict(color="#cdd9e5", size=11)
-    return fig
-
-
-# ════════════════════════════════════════════════════════════════════════════
-#  CARGA DE FRAMES
-# ════════════════════════════════════════════════════════════════════════════
-
-def load_frames_from_images(uploaded_files, assumed_fps: float = 1.0):
-    if len(uploaded_files) < 2:
-        raise ValueError("Se necesitan al menos 2 imágenes para calcular flujo óptico.")
-    sorted_files = sorted(uploaded_files, key=lambda f: f.name)
-    frames = []
-    failed = []
-    for i, uf in enumerate(sorted_files):
-        raw = uf.read()
-        arr = np.frombuffer(raw, dtype=np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if img is None:
-            failed.append(uf.name); continue
-        t = i / assumed_fps
-        frames.append((t, img))
-    if failed:
-        st.warning(f"No se pudieron leer {len(failed)} imagen(es): {', '.join(failed[:5])}")
-    if len(frames) < 2:
-        raise ValueError("Menos de 2 imágenes válidas cargadas.")
-    dur = frames[-1][0]
-    fps = assumed_fps
-    return frames, dur, fps
-
-
-def extract_frames_from_video(video_bytes: bytes, n_frames: int):
-    cap = None; tmp_path = None
-    for suffix in (".mp4", ".avi", ".mov", ".mkv"):
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
-            f.write(video_bytes); tmp_path = f.name
-        cap = cv2.VideoCapture(tmp_path)
-        if cap.isOpened(): break
-        cap.release(); os.unlink(tmp_path); cap = None
-    if cap is None:
-        raise RuntimeError("No se pudo abrir el video.")
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    dur   = total / fps
-    idxs  = np.linspace(0, total - 1, n_frames, dtype=int)
-    frames = []
-    for idx in idxs:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
-        ret, frm = cap.read()
-        if ret: frames.append((idx / fps, frm))
-    cap.release()
-    try: os.unlink(tmp_path)
-    except: pass
-    return frames, dur, fps
-
-
-# ════════════════════════════════════════════════════════════════════════════
-#  CARGA EXCEL
-# ════════════════════════════════════════════════════════════════════════════
 
 def parse_excel_series(uploaded_file) -> dict:
     import pandas as pd
@@ -1823,47 +1492,19 @@ def main():
         frame_filter_placeholder = st.empty()
 
         st.divider()
-        st.header("BiLSTM — Hiperparámetros")
+        st.header("Modelo Autorregresivo -- Parametros")
         lstm_lookback = st.slider("Lookback (pasos historia)",  3, 60, 15, 1)
         lstm_horizon  = st.slider("Horizon (pasos a predecir)", 1, 30, 5,  1)
-        lstm_arch_str = st.text_input("Arquitectura de capas (neuronas por capa)",
-            value="128, 64",
-            help="Ej: 128,64 → 2 capas. hidden_dim=máximo, n_layers=cantidad.")
-        try:
-            _arch_vals = [max(1, int(x.strip())) for x in lstm_arch_str.split(",") if x.strip()]
-            if not _arch_vals: _arch_vals = [128]
-        except ValueError:
-            _arch_vals = [128]
-            st.sidebar.warning("Formato inválido — usando 128 neuronas, 1 capa.")
-        lstm_hidden = max(_arch_vals)
-        lstm_layers = len(_arch_vals)
-        st.sidebar.caption(
-            f"→ {lstm_layers} capa{'s' if lstm_layers > 1 else ''} · "
-            f"hidden_dim={lstm_hidden} · "
-            f"neuronas: {' → '.join(str(v) for v in _arch_vals)}")
-        lstm_dropout = st.slider("Dropout",              0.0, 0.7, 0.30, 0.05)
-        lstm_bidir   = st.checkbox("Bidireccional", value=True)
-        lstm_lr      = st.select_slider("Learning rate",
-                        options=[1e-4, 3e-4, 5e-4, 1e-3, 3e-3, 5e-3, 1e-2],
-                        value=1e-3, format_func=lambda x: f"{x:.0e}")
-        lstm_epochs  = st.slider("Epochs máximos",       20, 300, 80, 10)
-        lstm_batch   = st.slider("Batch size",           8, 128, 16, 8)
-        lstm_wd      = st.select_slider("Weight decay",
-                        options=[0.0, 1e-5, 1e-4, 1e-3, 1e-2],
-                        value=1e-4, format_func=lambda x: f"{x:.0e}")
-        lstm_patience  = st.slider("Early stopping patience", 5, 50, 10, 5)
-        lstm_sch_step  = st.slider("Scheduler step (epochs)", 10, 100, 30, 5)
-        lstm_sch_gamma = st.slider("Scheduler gamma",         0.1, 0.99, 0.5, 0.05)
-
-        st.divider()
-        st.header("Modelo Híbrido")
-        use_hybrid   = st.checkbox("Usar modelo híbrido", value=True)
-        hybrid_trend = st.selectbox("Tipo de tendencia",
-                        ["auto", "exponential", "logistic", "power", "polynomial"], index=0)
-
-        st.divider()
-        st.header("Walk-Forward Validation")
-        use_wfv = st.checkbox("Activar Walk-Forward Validation", value=True)
+        lstm_hidden   = st.slider("Capa oculta (neuronas)",    16, 256, 64, 16)
+        lstm_epochs   = st.slider("Epochs maximos",         50, 500, 200, 50)
+        lstm_lr       = st.select_slider("Learning rate",
+                          options=[1e-4, 3e-4, 5e-4, 1e-3, 3e-3, 5e-3, 1e-2],
+                          value=1e-3, format_func=lambda x: f"{x:.0e}")
+        # variables de compatibilidad (no usadas en autoreg)
+        lstm_layers = 1; lstm_dropout = 0.0; lstm_bidir = False
+        lstm_batch = 16; lstm_wd = 0.0; lstm_patience = 20
+        lstm_sch_step = 30; lstm_sch_gamma = 0.5
+        use_wfv = False; use_hybrid = False; hybrid_trend = "auto"
 
     st.markdown("---")
     input_mode = st.radio("Fuente de entrada",
@@ -2099,79 +1740,30 @@ def main():
                     "1/v Procesada":       np.round(inv_proc_i[:_n_t], 6)})
                 st.dataframe(_df_t, use_container_width=True, hide_index=True)
 
-        # WFV config
-        wfv_n_splits = 3; wfv_min_frac = 0.5; wfv_epochs = 40; wfv_patience = 8
-        if use_wfv:
-            with st.expander("⚙️ Parámetros Walk-Forward Validation", expanded=False):
-                wfv_col1, wfv_col2 = st.columns(2)
-                with wfv_col1:
-                    wfv_n_splits = st.slider("Número de folds WFV", 2, 10, 5, 1, key="wfv_n_splits")
-                    wfv_min_frac = st.slider("Fracción mínima de entrenamiento",
-                                              0.3, 0.8, 0.5, 0.05, key="wfv_min_frac")
-                with wfv_col2:
-                    wfv_epochs   = st.slider("Epochs por fold WFV", 20, 200, 60, 10, key="wfv_epochs")
-                    wfv_patience = st.slider("Patience por fold WFV", 5, 30, 10, 1, key="wfv_patience")
-
-        lstm_excel_btn = st.button("Entrenar BiLSTM en todas las series",
+        lstm_excel_btn = st.button("Entrenar modelo autorregresivo",
                                     type="primary", key="lstm_excel_btn")
 
         if lstm_excel_btn:
             results = {}
             for idx, (ts_iv_i, inv_proc_i, inv_raw_i, _, _, _, lbl_raw) in enumerate(inv_seg_only_list):
                 serie_lstm = inv_proc_i
-                n_min = lstm_lookback + 6
+                n_min = lstm_lookback + 4
                 lbl = series_list[idx]["name"]
                 if len(serie_lstm) < n_min:
                     st.warning(f"{lbl}: serie demasiado corta ({len(serie_lstm)} pts). Saltando.")
                     continue
                 st.markdown(f"##### Entrenando: `{lbl}`")
-                prog = st.progress(0, text=f"{lbl} — entrenando...")
-                trend_info_saved = None
+                prog = st.progress(0, text=f"{lbl} -- entrenando...")
                 try:
-                    if use_hybrid:
-                        pred_tr, fut, metr, hloss, hval, trend_info_saved = train_hybrid(
-                            serie_lstm, lookback=lstm_lookback, horizon=lstm_horizon,
-                            hidden_dim=lstm_hidden, n_layers=lstm_layers,
-                            dropout=lstm_dropout, bidirectional=lstm_bidir,
-                            lr=lstm_lr, epochs=lstm_epochs, batch_size=lstm_batch,
-                            weight_decay=lstm_wd, patience=lstm_patience,
-                            scheduler_step=lstm_sch_step, scheduler_gamma=lstm_sch_gamma,
-                            trend_type=hybrid_trend)
-                    else:
-                        pred_tr, fut, metr, hloss, hval = train_bilstm(
-                            serie_lstm, lookback=lstm_lookback, horizon=lstm_horizon,
-                            hidden_dim=lstm_hidden, n_layers=lstm_layers,
-                            dropout=lstm_dropout, bidirectional=lstm_bidir,
-                            lr=lstm_lr, epochs=lstm_epochs, batch_size=lstm_batch,
-                            weight_decay=lstm_wd, patience=lstm_patience,
-                            scheduler_step=lstm_sch_step, scheduler_gamma=lstm_sch_gamma)
-                    prog.progress(0.4, text=f"{lbl} — modelo OK, iniciando WFV...")
+                    pred_tr, fut, metr, hloss, hval = train_autoreg(
+                        serie_lstm, lookback=lstm_lookback, horizon=lstm_horizon,
+                        hidden_dim=lstm_hidden, epochs=lstm_epochs, lr=lstm_lr)
+                    prog.progress(1.0, text=f"{lbl} -- completado OK")
                 except Exception as e:
                     prog.empty()
                     st.error(f"Error entrenando {lbl}: {e}")
                     continue
-
-                wfv_res = None
-                if use_wfv and len(serie_lstm) >= n_min * 2:
-                    try:
-                        def _wfv_cb(frac, _p=prog, _l=lbl, _n=wfv_n_splits):
-                            _p.progress(0.4 + frac * 0.6,
-                                        text=f"{_l} — WFV fold {int(frac*_n)}/{_n}")
-                        wfv_res = walk_forward_validation(
-                            serie_lstm, lookback=lstm_lookback, horizon=lstm_horizon,
-                            hidden_dim=lstm_hidden, n_layers=lstm_layers,
-                            dropout=lstm_dropout, bidirectional=lstm_bidir,
-                            lr=lstm_lr, epochs=wfv_epochs, batch_size=lstm_batch,
-                            weight_decay=lstm_wd, patience=wfv_patience,
-                            scheduler_step=lstm_sch_step, scheduler_gamma=lstm_sch_gamma,
-                            n_splits=wfv_n_splits, min_train_frac=wfv_min_frac,
-                            progress_cb=_wfv_cb)
-                    except Exception as e:
-                        st.warning(f"WFV no pudo completarse para {lbl}: {e}")
-
-                prog.progress(1.0, text=f"{lbl} — completado ✓")
-                results[lbl] = (pred_tr, fut, metr, hloss, hval,
-                                ts_iv_i, serie_lstm, wfv_res, trend_info_saved)
+                results[lbl] = (pred_tr, fut, metr, hloss, hval, ts_iv_i, serie_lstm)
 
             st.session_state["excel_lstm_results"] = results if results else None
 
@@ -2179,100 +1771,26 @@ def main():
         xlr = st.session_state["excel_lstm_results"]
         if xlr:
             for lbl_res_idx, (lbl, entry) in enumerate(xlr.items()):
-                if len(entry) == 9:
-                    pred_tr, fut, metr, hloss, hval, ts_s, iv_s, wfv_res, trend_info_s = entry
-                else:
-                    pred_tr, fut, metr, hloss, hval = entry[0], entry[1], entry[2], entry[3], entry[4]
-                    ts_s, iv_s = entry[5], entry[6]
-                    wfv_res = entry[7] if len(entry) > 7 else None
-                    trend_info_s = entry[8] if len(entry) > 8 else None
-
+                pred_tr, fut, metr, hloss, hval = entry[0], entry[1], entry[2], entry[3], entry[4]
+                ts_s, iv_s = entry[5], entry[6]
                 st.markdown(f"#### {lbl}")
-                lf = wfv_res.get("last_forecast") if wfv_res else None
-                lf_ok = lf and "error" not in lf
-                fut_show     = lf["future_vals"]   if lf_ok else fut
-                pred_show    = lf["pred_full"]     if lf_ok else pred_tr
-                metr_show    = lf["metrics"]       if lf_ok else metr
-                hloss_show   = lf["history_loss"]  if lf_ok else hloss
-                hval_show    = lf.get("history_val") if lf_ok else hval
-
-                # Key única por serie y por resultado
                 _fig_key = f"excel_main_{lbl_res_idx}_{lbl[:20]}"
-
-                if trend_info_s is not None:
-                    fig_main = build_hybrid_figure(ts_s, iv_s, pred_show, fut_show,
-                        trend_info_s, metr_show, hloss_show, lstm_horizon,
-                        history_val=hval_show)
-                    all_r2 = trend_info_s.get("all_r2", {})
-                    r2_str = "  |  ".join(f"**{k}** R²={v:.3f}" for k, v in
-                                          sorted(all_r2.items(), key=lambda x: -x[1]))
-                    st.caption(f"Tendencias evaluadas → {r2_str}")
-                else:
-                    fig_main = build_lstm_figure(ts_s, iv_s, pred_show, fut_show,
-                        metr_show, hloss_show, lstm_horizon, history_val=hval_show)
-
+                fig_main = build_lstm_figure(ts_s, iv_s, pred_tr, fut,
+                    metr, hloss, lstm_horizon, history_val=hval)
                 st.plotly_chart(fig_main, use_container_width=True, key=_fig_key)
-
-                if lf_ok:
-                    st.info("**Pronóstico activo: WFV (modelo calibrado con toda la serie)**")
-
                 mc1, mc2, mc3, mc4 = st.columns(4)
-                mc1.metric("MAE",  f"{metr_show['MAE']:.5f}")
-                mc2.metric("RMSE", f"{metr_show['RMSE']:.5f}")
-                mc3.metric("MAPE", f"{metr_show['MAPE']:.2f}%")
-                mc4.metric("R²",   f"{metr_show['R2']:.4f}")
-
-                if trend_info_s is not None:
-                    st.caption(f"Tendencia: **{trend_info_s['trend_type']}** "
-                               f"(R²={trend_info_s['r2']:.4f}) · BiLSTM sobre residuo")
-
-                if lf_ok:
-                    with st.expander("Métricas modelo inicial (referencia)"):
-                        rm1, rm2, rm3, rm4 = st.columns(4)
-                        rm1.metric("MAE",  f"{metr['MAE']:.5f}")
-                        rm2.metric("RMSE", f"{metr['RMSE']:.5f}")
-                        rm3.metric("MAPE", f"{metr['MAPE']:.2f}%")
-                        rm4.metric("R²",   f"{metr['R2']:.4f}")
-
-                if wfv_res:
-                    agg = wfv_res["agg"]
-                    st.markdown("**Validación Cruzada Walk-Forward**")
-                    st.caption(f"{agg['n_folds']} folds completados")
-                    wc1, wc2, wc3, wc4 = st.columns(4)
-                    wc1.metric("MAE WFV",  f"{agg['MAE_mean']:.5f}", delta=f"±{agg['MAE_std']:.5f}")
-                    wc2.metric("RMSE WFV", f"{agg['RMSE_mean']:.5f}", delta=f"±{agg['RMSE_std']:.5f}")
-                    wc3.metric("MAPE WFV", f"{agg['MAPE_mean']:.2f}%", delta=f"±{agg['MAPE_std']:.2f}%")
-                    wc4.metric("R² WFV",   f"{agg['R2_mean']:.4f}", delta=f"±{agg['R2_std']:.4f}")
-                    fig_wfv = build_wfv_figure(wfv_res, iv_s, title=lbl)
-                    st.plotly_chart(fig_wfv, use_container_width=True,
-                                    key=f"excel_wfv_{lbl_res_idx}_{lbl[:20]}")
-                    with st.expander(f"Tabla detallada por fold — {lbl}"):
-                        fold_rows = []
-                        for f in wfv_res["folds"]:
-                            if "error" in f:
-                                fold_rows.append({"Fold": f["fold"],
-                                    "Estado": f"Error: {f['error']}",
-                                    "MAE":"—","RMSE":"—","MAPE":"—","R²":"—",
-                                    "Train pts":"—","Test pts":"—"})
-                            else:
-                                fold_rows.append({"Fold": f["fold"], "Estado": "✓",
-                                    "MAE": f"{f['mae']:.5f}", "RMSE": f"{f['rmse']:.5f}",
-                                    "MAPE": f"{f['mape']:.2f}%", "R²": f"{f['r2']:.4f}",
-                                    "Train pts": f["train_size"], "Test pts": f["test_size"]})
-                        st.dataframe(pd.DataFrame(fold_rows),
-                                     use_container_width=True, hide_index=True)
-                else:
-                    st.caption("Serie demasiado corta para Walk-Forward Validation.")
-
-                with st.expander(f"Pronóstico detallado — {lbl}"):
+                mc1.metric("MAE",  f"{metr['MAE']:.5f}")
+                mc2.metric("RMSE", f"{metr['RMSE']:.5f}")
+                mc3.metric("MAPE", f"{metr['MAPE']:.2f}%")
+                mc4.metric("R²",   f"{metr['R2']:.4f}")
+                with st.expander(f"Pronostico detallado \u2014 {lbl}"):
                     dt_ = float(np.mean(np.diff(ts_s))) if len(ts_s) > 1 else 1.0
                     t_fut_ = ts_s[-1] + np.arange(1, lstm_horizon + 1) * dt_
-                    fut_table = fut_show if lf_ok else fut
                     st.dataframe(pd.DataFrame({
                         "Paso": list(range(1, lstm_horizon + 1)),
                         "t (s)": [f"{t:.1f}" for t in t_fut_],
-                        "1/|Δdisp| pred.": [f"{v:.6f}" for v in fut_table],
-                        "|Δdisp| estimado (mm)": [f"{1/(v+1e-9):.8f}" for v in fut_table]}),
+                        "1/|\u0394disp| pred.": [f"{v:.6f}" for v in fut],
+                        "|\u0394disp| estimado (mm)": [f"{1/(v+1e-9):.8f}" for v in fut]}),
                         use_container_width=True)
         return
 
@@ -2690,182 +2208,73 @@ def main():
         st.dataframe(_df_traz, use_container_width=True, hide_index=True)
 
     inv_series_for_lstm = inv_lstm_seg
-
-    # WFV config
-    _wfv_splits = 3; _wfv_minfrac = 0.5; _wfv_ep = 40; _wfv_pat = 8
-    if use_wfv:
-        with st.expander("⚙️ Parámetros Walk-Forward Validation", expanded=False):
-            _wfv_c1, _wfv_c2 = st.columns(2)
-            with _wfv_c1:
-                _wfv_splits  = st.slider("Número de folds WFV", 2, 8, 4, 1, key="vid_wfv_splits")
-                _wfv_minfrac = st.slider("Fracción mín. entrenamiento",
-                                          0.3, 0.8, 0.5, 0.05, key="vid_wfv_minfrac")
-            with _wfv_c2:
-                _wfv_ep   = st.slider("Epochs por fold WFV", 20, 150, 50, 10, key="vid_wfv_ep")
-                _wfv_pat  = st.slider("Patience por fold WFV", 5, 25, 10, 1, key="vid_wfv_pat")
+    inv_series_for_lstm = inv_lstm_seg
 
     st.divider()
-    lstm_btn = st.button("Entrenar BiLSTM y pronosticar", type="primary")
+    lstm_btn = st.button("Entrenar modelo autorregresivo y pronosticar", type="primary")
 
     if lstm_btn:
-        n_min = lstm_lookback + 6
+        n_min = lstm_lookback + 4
         if len(inv_series_for_lstm) < n_min:
             st.error(
                 f"Serie demasiado corta ({len(inv_series_for_lstm)} puntos). "
                 f"Necesitas al menos {n_min} puntos.")
         else:
-            prog_bar = st.progress(0, text="Entrenando...")
-            wfv_res_vid = None; trend_info_vid = None
+            prog_bar = st.progress(0, text="Entrenando modelo autorregresivo...")
             try:
-                if use_hybrid:
-                    pred_tr, fut, metr, hloss, hval, trend_info_vid = train_hybrid(
-                        inv_series_for_lstm, lookback=lstm_lookback, horizon=lstm_horizon,
-                        hidden_dim=lstm_hidden, n_layers=lstm_layers, dropout=lstm_dropout,
-                        bidirectional=lstm_bidir, lr=lstm_lr, epochs=lstm_epochs,
-                        batch_size=lstm_batch, weight_decay=lstm_wd, patience=lstm_patience,
-                        scheduler_step=lstm_sch_step, scheduler_gamma=lstm_sch_gamma,
-                        trend_type=hybrid_trend)
-                else:
-                    pred_tr, fut, metr, hloss, hval = train_bilstm(
-                        inv_series_for_lstm, lookback=lstm_lookback, horizon=lstm_horizon,
-                        hidden_dim=lstm_hidden, n_layers=lstm_layers, dropout=lstm_dropout,
-                        bidirectional=lstm_bidir, lr=lstm_lr, epochs=lstm_epochs,
-                        batch_size=lstm_batch, weight_decay=lstm_wd, patience=lstm_patience,
-                        scheduler_step=lstm_sch_step, scheduler_gamma=lstm_sch_gamma)
-                prog_bar.progress(0.4, text="Modelo final OK — iniciando WFV...")
-
-                if use_wfv and len(inv_series_for_lstm) >= n_min * 2:
-                    try:
-                        def _vid_wfv_cb(frac, _pb=prog_bar, _n=_wfv_splits):
-                            _pb.progress(0.4 + frac * 0.6,
-                                         text=f"Walk-Forward Validation — fold {int(frac*_n)}/{_n}")
-                        wfv_res_vid = walk_forward_validation(
-                            inv_series_for_lstm, lookback=lstm_lookback,
-                            hidden_dim=lstm_hidden, horizon=lstm_horizon,
-                            n_layers=lstm_layers, dropout=lstm_dropout,
-                            bidirectional=lstm_bidir, lr=lstm_lr, epochs=_wfv_ep,
-                            batch_size=lstm_batch, weight_decay=lstm_wd, patience=_wfv_pat,
-                            scheduler_step=lstm_sch_step, scheduler_gamma=lstm_sch_gamma,
-                            n_splits=_wfv_splits, min_train_frac=_wfv_minfrac,
-                            progress_cb=_vid_wfv_cb)
-                    except Exception as e:
-                        st.warning(f"WFV no pudo completarse: {e}")
-
-                prog_bar.progress(1.0, text="¡Entrenamiento completado!")
+                pred_tr, fut, metr, hloss, hval = train_autoreg(
+                    inv_series_for_lstm, lookback=lstm_lookback, horizon=lstm_horizon,
+                    hidden_dim=lstm_hidden, epochs=lstm_epochs, lr=lstm_lr)
+                prog_bar.progress(1.0, text="Entrenamiento completado!")
                 st.session_state["lstm_result"] = (
                     pred_tr, fut, metr, hloss, hval,
-                    ts_iv_lstm, inv_lstm_seg, lstm_horizon,
-                    wfv_res_vid, trend_info_vid)
+                    ts_iv_lstm, inv_lstm_seg, lstm_horizon)
             except Exception as e:
                 prog_bar.empty()
-                st.error(f"Error en BiLSTM: {e}")
+                st.error(f"Error en modelo autorregresivo: {e}")
                 st.session_state["lstm_result"] = None
 
     lr_res = st.session_state["lstm_result"]
     if lr_res:
-        if len(lr_res) == 10:
-            pred_tr, fut, metr, hloss, hval, ts_lstm, iv_lstm, _hor, _wfv_vid, _trend_vid = lr_res
-        else:
-            pred_tr, fut, metr, hloss = lr_res[0], lr_res[1], lr_res[2], lr_res[3]
-            hval = lr_res[4] if len(lr_res) > 4 else None
-            ts_lstm = lr_res[5] if len(lr_res) > 5 else ts_iv_lstm
-            iv_lstm = lr_res[6] if len(lr_res) > 6 else inv_lstm_seg
-            _hor = lr_res[7] if len(lr_res) > 7 else lstm_horizon
-            _wfv_vid = lr_res[8] if len(lr_res) > 8 else None
-            _trend_vid = lr_res[9] if len(lr_res) > 9 else None
+        pred_tr, fut, metr, hloss = lr_res[0], lr_res[1], lr_res[2], lr_res[3]
+        hval    = lr_res[4] if len(lr_res) > 4 else None
+        ts_lstm = lr_res[5] if len(lr_res) > 5 else ts_iv_lstm
+        iv_lstm = lr_res[6] if len(lr_res) > 6 else inv_lstm_seg
+        _hor    = lr_res[7] if len(lr_res) > 7 else lstm_horizon
 
-        _lf = _wfv_vid.get("last_forecast") if _wfv_vid else None
-        _lf_ok = _lf and "error" not in _lf
-        _fut_show   = _lf["future_vals"]   if _lf_ok else fut
-        _pred_show  = _lf["pred_full"]     if _lf_ok else pred_tr
-        _metr_show  = _lf["metrics"]       if _lf_ok else metr
-        _hloss_show = _lf["history_loss"]  if _lf_ok else hloss
-        _hval_show  = _lf.get("history_val") if _lf_ok else hval
-
-        if _trend_vid is not None:
-            fig_main = build_hybrid_figure(ts_lstm, iv_lstm, _pred_show, _fut_show,
-                _trend_vid, _metr_show, _hloss_show, _hor, history_val=_hval_show)
-            all_r2 = _trend_vid.get("all_r2", {})
-            r2_str = "  |  ".join(f"**{k}** R²={v:.3f}" for k, v in
-                                   sorted(all_r2.items(), key=lambda x: -x[1]))
-            st.caption(f"Tendencias evaluadas → {r2_str}")
-        else:
-            fig_main = build_lstm_figure(ts_lstm, iv_lstm, _pred_show, _fut_show,
-                _metr_show, _hloss_show, _hor, history_val=_hval_show)
-
+        fig_main = build_lstm_figure(ts_lstm, iv_lstm, pred_tr, fut,
+            metr, hloss, _hor, history_val=hval)
         st.plotly_chart(fig_main, use_container_width=True, key="vid_lstm_main")
 
-        if _lf_ok:
-            st.info("**Pronóstico activo: WFV calibrado (toda la serie)**")
-
-        st.markdown("**Métricas modelo activo**")
+        st.markdown("**Metricas del modelo**")
         mc1, mc2, mc3, mc4 = st.columns(4)
-        mc1.metric("MAE",  f"{_metr_show['MAE']:.5f}")
-        mc2.metric("RMSE", f"{_metr_show['RMSE']:.5f}")
-        mc3.metric("MAPE", f"{_metr_show['MAPE']:.2f}%")
-        mc4.metric("R²",   f"{_metr_show['R2']:.4f}")
+        mc1.metric("MAE",  f"{metr['MAE']:.5f}")
+        mc2.metric("RMSE", f"{metr['RMSE']:.5f}")
+        mc3.metric("MAPE", f"{metr['MAPE']:.2f}%")
+        mc4.metric("R²",   f"{metr['R2']:.4f}")
 
-        if _trend_vid is not None:
-            st.caption(f"Tendencia: **{_trend_vid['trend_type']}** "
-                       f"(R²={_trend_vid['r2']:.4f}) · BiLSTM sobre residuo")
-
-        if _wfv_vid:
-            _agg = _wfv_vid["agg"]
-            st.markdown("**Validación Cruzada Walk-Forward**")
-            st.caption(f"{_agg['n_folds']} folds completados")
-            wc1, wc2, wc3, wc4 = st.columns(4)
-            wc1.metric("MAE WFV",  f"{_agg['MAE_mean']:.5f}", delta=f"±{_agg['MAE_std']:.5f}")
-            wc2.metric("RMSE WFV", f"{_agg['RMSE_mean']:.5f}", delta=f"±{_agg['RMSE_std']:.5f}")
-            wc3.metric("MAPE WFV", f"{_agg['MAPE_mean']:.2f}%", delta=f"±{_agg['MAPE_std']:.2f}%")
-            wc4.metric("R² WFV",   f"{_agg['R2_mean']:.4f}", delta=f"±{_agg['R2_std']:.4f}")
-            fig_wfv_v = build_wfv_figure(_wfv_vid, iv_lstm, title="Video/Imágenes")
-            st.plotly_chart(fig_wfv_v, use_container_width=True, key="vid_wfv_fig")
-            with st.expander("Tabla detallada por fold"):
-                import pandas as _pd_v
-                _rows = []
-                for _f in _wfv_vid["folds"]:
-                    if "error" in _f:
-                        _rows.append({"Fold": _f["fold"],
-                            "Estado": f"Error: {_f['error']}",
-                            "MAE":"—","RMSE":"—","MAPE":"—","R²":"—",
-                            "Train pts":"—","Test pts":"—"})
-                    else:
-                        _rows.append({"Fold": _f["fold"], "Estado": "✓",
-                            "MAE": f"{_f['mae']:.5f}", "RMSE": f"{_f['rmse']:.5f}",
-                            "MAPE": f"{_f['mape']:.2f}%", "R²": f"{_f['r2']:.4f}",
-                            "Train pts": _f["train_size"], "Test pts": _f["test_size"]})
-                st.dataframe(_pd_v.DataFrame(_rows), use_container_width=True, hide_index=True)
-        else:
-            st.caption("Serie demasiado corta para Walk-Forward Validation.")
-
-        with st.expander("Detalles del modelo y pronóstico"):
+        with st.expander("Detalles del modelo y pronostico"):
             import pandas as pd
             c_a, c_b = st.columns(2)
             with c_a:
                 st.markdown(f"""
-| Parámetro | Valor |
+| Parametro | Valor |
 |-----------|-------|
-| Lookback  | {metr['lookback']} |
-| Horizon   | {metr['horizon']} |
-| Hidden dim | {metr['hidden_dim']} |
-| Capas LSTM | {metr['n_layers']} |
-| Bidireccional | {metr['bidirectional']} |
-| Dropout | {metr['dropout']} |
-| LR | {metr['lr']:.0e} |
-| Parámetros totales | {metr['n_params']:,} |
-| Epochs ejecutados | {metr['epochs_run']} |
-| Mejor val loss | {metr['best_val_loss']:.6f} |
+| Lookback  | {metr["lookback"]} |
+| Horizon   | {metr["horizon"]} |
+| Capa oculta | {metr["hidden_dim"]} |
+| Parametros totales | {metr["n_params"]:,} |
+| Epochs ejecutados | {metr["epochs_run"]} |
+| LR | {metr["lr"]:.0e} |
 """)
             with c_b:
                 dt = float(np.mean(np.diff(ts_lstm))) if len(ts_lstm) > 1 else 1.0
                 t_fut = ts_lstm[-1] + np.arange(1, _hor + 1) * dt
-                _fut_table = _lf["future_vals"] if _lf_ok else fut
-                st.caption("Pronóstico WFV" if _lf_ok else "Pronóstico modelo final")
                 df_fut = pd.DataFrame({
                     "Paso": list(range(1, _hor + 1)),
                     "t (s)": [f"{t:.2f}" for t in t_fut],
-                    "1/v predicho": [f"{v:.5f}" for v in _fut_table],
-                    "v estimada px/frame": [f"{1/(v+1e-9):.3f}" for v in _fut_table]})
+                    "1/v predicho": [f"{v:.5f}" for v in fut],
+                    "v estimada px/frame": [f"{1/(v+1e-9):.3f}" for v in fut]})
                 st.dataframe(df_fut, use_container_width=True)
 
     # Comparación personalizada de frames
