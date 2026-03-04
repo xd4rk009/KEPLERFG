@@ -7,4 +7,6 @@ plotly
 pandas
 matplotlib
 openpyxl
+sklearn
+
 
