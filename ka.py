@@ -856,6 +856,43 @@ def _huber(pred, target, delta=0.5):
     grad = r if ar <= delta else delta * np.sign(r)
     return loss, grad
 
+def fukuzono_linear_extrap(inv_v_arr, t_days_arr, fit_window=None, n_steps=1,
+                            step_days=1.0):
+    """
+    Extrapolación lineal de Fukuzono con OLS ponderado exponencialmente.
+    Ajusta  1/v(t) = a + b*t  sobre la ventana reciente (fit_window puntos)
+    con pesos que enfatizan los puntos más recientes.
+    Retorna los n_steps valores proyectados, el slope b y el intercept a.
+    """
+    n = len(inv_v_arr)
+    if fit_window is None:
+        fit_window = max(4, min(20, n // 3))
+    k = min(fit_window, n)
+    t_fit  = t_days_arr[-k:].astype(np.float64)
+    iv_fit = inv_v_arr[-k:].astype(np.float64)
+
+    # Pesos exponenciales: el más reciente tiene peso 1.0
+    w = np.exp(np.linspace(-2.0, 0.0, k))
+
+    # Normalizar t para estabilidad numérica
+    t0  = t_fit[-1]
+    t_n = t_fit - t0   # último punto = 0, anteriores < 0
+
+    A = np.column_stack([t_n, np.ones(k)])
+    W = np.diag(w)
+    AtWA = A.T @ W @ A
+    AtWy = A.T @ W @ iv_fit
+    try:
+        coeffs = np.linalg.solve(AtWA + np.eye(2) * 1e-10, AtWy)
+        b, a = float(coeffs[0]), float(coeffs[1])
+    except np.linalg.LinAlgError:
+        b, a = 0.0, float(iv_fit[-1])
+
+    t_future = np.arange(1, n_steps + 1) * step_days
+    proj = a + b * t_future
+    proj = np.maximum(0.0, proj)
+    return proj, b, a
+
 
 def train_fukuzono(inv_v_arr, disp_arr, vel_arr, t_days_arr,
                    seq_len=20, hidden_dim=64, n_layers=1,
@@ -1049,13 +1086,17 @@ def train_fukuzono(inv_v_arr, disp_arr, vel_arr, t_days_arr,
     future_inv_v = []; future_t_off = []
     step_days = step_hours / 24.0
 
-    # Trend estimado de los últimos puntos para validar dirección
-    _last_k = min(10, n // 4)
-    _trend_slope = 0.0
-    if _last_k >= 3:
-        _xt = np.arange(_last_k)
-        _yt = inv_v_smooth[-_last_k:]
-        _trend_slope = float(np.polyfit(_xt, _yt, 1)[0])
+    # Estimar tendencia lineal robusta sobre los últimos ~25% de la serie
+    # usando regresión ponderada (puntos recientes = más peso).
+    # Esta tendencia se usa como "ancla" para evitar que el modelo se estabilice.
+    _last_k = max(4, min(n // 4, 20))
+    _xt = np.arange(_last_k, dtype=float)
+    _yt = inv_v_smooth[-_last_k:]
+    _wt = np.exp(np.linspace(-1.5, 0.0, _last_k))  # pesos exp: más peso a recientes
+    _xt_c = _xt - _xt.mean()
+    _trend_slope = float(np.sum(_wt * _xt_c * (_yt - np.average(_yt, weights=_wt)))
+                         / (np.sum(_wt * _xt_c ** 2) + 1e-12))
+    _anchor_base = float(inv_v_smooth[-1])  # nivel de arranque de la proyección
 
     for step in range(max_steps):
         feats_buf = engineer_features_fuku(
@@ -1063,10 +1104,19 @@ def train_fukuzono(inv_v_arr, disp_arr, vel_arr, t_days_arr,
             np.array(buf_vel),   np.array(buf_t))
         win = feats_buf[-seq_len:].astype(np.float64)
 
-        next_inv_v = max(0.0, _predict_one(win))
-        next_t     = buf_t[-1] + step_days
-        next_vel   = 1.0 / (next_inv_v + 1e-8)
-        next_disp  = buf_disp[-1] + next_vel * step_days
+        lstm_pred  = max(0.0, _predict_one(win))
+
+        # Proyección lineal ancla: continúa la tendencia observada desde el
+        # último punto real, decayendo el peso del ancla con el tiempo para
+        # dar más libertad al LSTM en pasos lejanos.
+        anchor_pred = max(0.0, _anchor_base + _trend_slope * (step + 1))
+        blend_w     = max(0.0, 1.0 - step / max(1, max_steps))  # 1→0 linealmente
+        next_inv_v  = blend_w * anchor_pred + (1.0 - blend_w) * lstm_pred
+        next_inv_v  = max(0.0, next_inv_v)
+
+        next_t    = buf_t[-1] + step_days
+        next_vel  = 1.0 / (next_inv_v + 1e-8)
+        next_disp = buf_disp[-1] + next_vel * step_days
 
         future_inv_v.append(next_inv_v)
         future_t_off.append(next_t - t_days_arr[-1])
