@@ -1,35 +1,29 @@
 """
-ANÁLISIS ÓPTICO DE VÍDEO TÉRMICO — Streamlit v4 (optimizado)
-Mejoras de rendimiento:
-  - @st.cache_data en funciones pesadas de procesamiento
-  - Eliminación de st.rerun() innecesarios
-  - Keys únicas y estables en todos los st.plotly_chart
-  - session_state inicializado de forma segura (sin sobrescribir)
-  - Lógica de invalidación de caché por clave de parámetros (sin reruns)
-  - Evitar recálculos repetidos de señal en cada interacción
+ANÁLISIS ÓPTICO DE VÍDEO TÉRMICO — Streamlit v5
+Cambios respecto a v4:
+  - BiLSTM numpy puro REEMPLAZADO por FukuzonoLSTM (PyTorch):
+      BiLSTM + SelfAttention + cabeza de regresión
+      Feature engineering de 14 variables (Fukuzono ratio, rolling stats, etc.)
+      Predicción AUTORREGRESIVA hasta 1/v → 0
+  - Walk-Forward Validation ELIMINADO
+  - Modelo Híbrido ELIMINADO
+  - STL visual MANTENIDO
 """
 
 import warnings, tempfile, os
 import numpy as np
 import cv2
 import streamlit as st
+from skimage.morphology import remove_small_objects
 from scipy.signal import savgol_filter, butter, filtfilt
 from scipy.ndimage import uniform_filter1d
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 warnings.filterwarnings("ignore")
-
-# -- remove_small_objects replacement (avoids scikit-image dependency) --
-def remove_small_objects(ar, min_size=64):
-    """Pure-numpy drop-in for skimage.morphology.remove_small_objects."""
-    ar = np.asarray(ar, dtype=bool)
-    out = ar.copy()
-    num_labels, labels = cv2.connectedComponents(ar.astype(np.uint8), connectivity=8)
-    for lbl in range(1, num_labels):
-        if np.sum(labels == lbl) < min_size:
-            out[labels == lbl] = False
-    return out
 
 # ─── PÁGINA ──────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -68,8 +62,10 @@ PLOTLY_LAYOUT = dict(
     margin=dict(l=60, r=20, t=50, b=50),
 )
 
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 # ════════════════════════════════════════════════════════════════════════════
-#  FUNCIONES CORE — flujo óptico avanzado
+#  FLUJO ÓPTICO — sin cambios
 # ════════════════════════════════════════════════════════════════════════════
 
 def to_gray(img):
@@ -77,8 +73,6 @@ def to_gray(img):
         return img
     return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-
-# ─── Detección de máscara ────────────────────────────────────────────────────
 
 def detect_smoke_mask(img_gray, blur_k=21, texture_thresh=3.5, dark_thresh=80):
     h, w = img_gray.shape
@@ -109,15 +103,6 @@ def detect_motion_opencv(g1, g2, smoke, diff_thresh=12.0, min_area=200):
     mu = cv2.morphologyEx(mu, cv2.MORPH_OPEN,
                           cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
     return remove_small_objects(mu.astype(bool), min_size=min_area), diff
-
-
-# ─── ALGORITMOS DE FLUJO ────────────────────────────────────────────────────
-
-def _build_pyramid(img, levels, scale=0.5):
-    pyr = [img.astype(np.float32)]
-    for _ in range(levels - 1):
-        pyr.append(cv2.pyrDown(pyr[-1]))
-    return pyr
 
 
 def _warp_flow(img, flow):
@@ -151,10 +136,9 @@ def _correlation_volume(f1, f2, radius=4):
     return corr
 
 
-def _flow_raft_lite(g1, g2,
-                    iters=12, corr_radius=4, corr_levels=4,
-                    update_iters=6, alpha_smooth=0.5,
-                    feature_channels=32, downsample_factor=4):
+def _flow_raft_lite(g1, g2, iters=12, corr_radius=4, corr_levels=4,
+                    update_iters=6, alpha_smooth=0.5, feature_channels=32,
+                    downsample_factor=4):
     h0, w0 = g1.shape
     ds = max(1, downsample_factor)
     h, w = h0 // ds, w0 // ds
@@ -359,13 +343,11 @@ def flow_to_hsv_color(flow):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  PROCESAMIENTO DE SEÑAL
+#  PROCESAMIENTO DE SEÑAL — sin cambios
 # ════════════════════════════════════════════════════════════════════════════
 
-def apply_outlier_filter(signal: np.ndarray, method: str = "IQR",
-                          iqr_k: float = 1.5, zscore_thr: float = 3.0,
-                          clip_min: float = None, clip_max: float = None,
-                          replace: str = "interpolate") -> np.ndarray:
+def apply_outlier_filter(signal, method="IQR", iqr_k=1.5, zscore_thr=3.0,
+                          clip_min=None, clip_max=None, replace="interpolate"):
     s = signal.astype(float).copy()
     n = len(s)
     if n < 4:
@@ -402,10 +384,8 @@ def apply_outlier_filter(signal: np.ndarray, method: str = "IQR",
     return s
 
 
-def apply_signal_processing(signal: np.ndarray, method: str,
-                              window: int = 5, polyorder: int = 2,
-                              cutoff: float = 0.1, fourier_terms: int = 10,
-                              block_size: int = 5) -> np.ndarray:
+def apply_signal_processing(signal, method, window=5, polyorder=2,
+                              cutoff=0.1, fourier_terms=10, block_size=5):
     n = len(signal)
     if n < 4:
         return signal.copy()
@@ -452,8 +432,7 @@ def apply_signal_processing(signal: np.ndarray, method: str,
     return signal.copy()
 
 
-def stl_decompose(signal: np.ndarray, timestamps: np.ndarray,
-                   period: int = None) -> dict:
+def stl_decompose(signal, timestamps, period=None):
     s = signal.astype(float).copy()
     n = len(s)
     if n < 8:
@@ -500,9 +479,7 @@ def stl_decompose(signal: np.ndarray, timestamps: np.ndarray,
             "residual": residual, "period": period, "n": n}
 
 
-def build_decomposition_figure(decomp: dict, title: str,
-                                 y_label: str = "Valor",
-                                 timestamps: np.ndarray = None) -> go.Figure:
+def build_decomposition_figure(decomp, title, y_label="Valor", timestamps=None):
     if decomp is None:
         return None
     ts = timestamps if timestamps is not None else np.arange(decomp["n"])
@@ -519,124 +496,356 @@ def build_decomposition_figure(decomp: dict, title: str,
         fig.update_yaxes(title_text=key[:3].capitalize(),
             tickfont=dict(size=9, color="#8b949e"),
             gridcolor=BORDER, row=row, col=1)
-    fig.update_xaxes(title_text="Tiempo (s)", row=4, col=1,
-                      gridcolor=BORDER, color="#8b949e")
+    fig.update_xaxes(title_text="Tiempo (s)", row=4, col=1, gridcolor=BORDER, color="#8b949e")
     fig.update_layout(**PLOTLY_LAYOUT,
-        title=dict(text=f"Descomposición STL — {title}",
-                   font=dict(color=CYAN, size=13)), height=580)
+        title=dict(text=f"Descomposición STL — {title}", font=dict(color=CYAN, size=13)),
+        height=580)
     for ann in fig["layout"]["annotations"]:
         ann["font"] = dict(color="#cdd9e5", size=11)
     return fig
 
 
-def render_outlier_and_decomp_ui(series_key: str, ts_arr: np.ndarray,
-                                   raw_signal: np.ndarray,
-                                   processed_signal: np.ndarray,
-                                   signal_label: str = "Señal",
-                                   decomp_period: int = None):
-    st.markdown(f"##### Outliers y Descomposición — {signal_label}")
-    col_out, col_decomp = st.columns([1, 1])
-    with col_out:
-        st.markdown("**Filtro de Outliers**")
-        apply_out = st.checkbox("Activar filtro outliers",
-                                 key=f"out_active_{series_key}", value=False)
-        out_order = st.radio("Aplicar filtro",
-                              ["Antes del tratamiento", "Después del tratamiento"],
-                              horizontal=True, key=f"out_order_{series_key}")
-        out_method = st.selectbox("Método",
-                                   ["IQR", "Z-score", "Rango manual"],
-                                   key=f"out_method_{series_key}")
-        out_replace = st.selectbox("Reemplazar outlier con",
-                                    ["interpolate", "mediana", "NaN→0"],
-                                    key=f"out_replace_{series_key}")
-        iqr_k = zscore_thr = 1.5
-        clip_min = clip_max = None
-        if out_method == "IQR":
-            iqr_k = st.slider("Factor IQR (k)", 0.5, 5.0, 1.5, 0.1,
-                               key=f"iqr_k_{series_key}")
-        elif out_method == "Z-score":
-            zscore_thr = st.slider("Umbral Z-score", 1.0, 6.0, 3.0, 0.1,
-                                    key=f"zscore_{series_key}")
-        elif out_method == "Rango manual":
-            v_min = float(raw_signal.min()); v_max = float(raw_signal.max())
-            clip_min = st.number_input("Valor mínimo permitido", value=v_min,
-                                        key=f"clip_min_{series_key}")
-            clip_max = st.number_input("Valor máximo permitido", value=v_max,
-                                        key=f"clip_max_{series_key}")
-    with col_decomp:
-        st.markdown("**Descomposición STL**")
-        do_decomp = st.checkbox("Mostrar descomposición",
-                                 key=f"decomp_active_{series_key}", value=False)
-        decomp_on = st.radio("Descomponer la señal",
-                              ["Procesada (post-tratamiento)", "Raw (original)"],
-                              horizontal=True, key=f"decomp_on_{series_key}")
-        period_auto = st.checkbox("Período automático",
-                                   key=f"period_auto_{series_key}", value=True)
-        if not period_auto:
-            decomp_period = st.slider("Período estacional (muestras)",
-                                       2, max(3, len(raw_signal)//2),
-                                       max(2, decomp_period or len(raw_signal)//8),
-                                       key=f"decomp_period_{series_key}")
+# ════════════════════════════════════════════════════════════════════════════
+#  FUKUZONO LSTM — PyTorch (nuevo modelo)
+# ════════════════════════════════════════════════════════════════════════════
+
+N_FEATURES_FUKU = 14
+
+
+def rolling_slope_np(arr, window):
+    slopes = np.full(len(arr), np.nan)
+    x = np.arange(window, dtype=np.float32)
+    for i in range(window - 1, len(arr)):
+        y = arr[i - window + 1: i + 1]
+        if np.any(np.isnan(y)):
+            continue
+        slopes[i] = np.polyfit(x, y, 1)[0]
+    return slopes
+
+
+def robust_scale(arr):
+    """Escala robusta (mediana / IQR) sin sklearn."""
+    med = np.nanmedian(arr)
+    q1  = np.nanpercentile(arr, 25)
+    q3  = np.nanpercentile(arr, 75)
+    iqr = q3 - q1 + 1e-8
+    return (arr - med) / iqr
+
+
+def engineer_features_fuku(inv_v_arr, disp_arr, vel_arr, t_days_arr,
+                            window_short=10, window_long=25):
+    """
+    Construye las 14 features del modelo Fukuzono a partir de arrays numpy.
+    Maneja series cortas (window > n) degradando a window=max(2, n).
+    """
+    n = len(inv_v_arr)
+    inv_v  = inv_v_arr.astype(np.float64)
+    disp   = disp_arr.astype(np.float64)
+    vel    = vel_arr.astype(np.float64)
+    t_days = t_days_arr.astype(np.float64)
+
+    ws = min(window_short, max(2, n - 1))
+    wl = min(window_long,  max(2, n - 1))
+
+    dt = np.gradient(t_days)
+    dt = np.where(np.abs(dt) < 1e-8, 1e-8, dt)
+    d_inv_v  = np.gradient(inv_v, dt)
+    d2_inv_v = np.gradient(d_inv_v, dt)
+
+    ratio      = np.where(np.abs(d_inv_v) > 1e-8, inv_v / d_inv_v, np.nan)
+    t_F_approx = t_days - ratio
+
+    # Rolling stats via stride tricks
+    def _roll_mean_std(x, w):
+        pad = np.pad(x, (w - 1, 0), mode='edge')
+        wins = np.lib.stride_tricks.sliding_window_view(pad, w)
+        return wins.mean(axis=1), wins.std(axis=1) + 1e-8
+
+    roll_mean, roll_std = _roll_mean_std(inv_v, ws)
+    sl_short = rolling_slope_np(inv_v, ws)
+    sl_long  = rolling_slope_np(inv_v, wl)
+
+    inv_v_max    = np.maximum.accumulate(inv_v)
+    pct_from_max = (inv_v_max - inv_v) / (inv_v_max + 1e-8)
+    ratio_roll   = inv_v / (roll_mean + 1e-8)
+    t_elap       = t_days / (t_days[-1] + 1e-8)
+
+    inv_v_norm = robust_scale(inv_v)
+    disp_norm  = robust_scale(disp)
+    vel_norm   = robust_scale(vel)
+
+    t_F_valid = np.where(np.isfinite(t_F_approx), t_F_approx,
+                         np.nanmedian(t_F_approx) if np.any(np.isfinite(t_F_approx)) else 0.0)
+    t_F_norm  = robust_scale(t_F_valid)
+
+    inv_v_log  = np.log1p(np.clip(inv_v, 0, None))
+    inv_v_log /= (np.max(inv_v_log) + 1e-8)
+
+    d1n  = np.clip(d_inv_v  / (np.nanstd(d_inv_v)  + 1e-8), -5, 5)
+    d2n  = np.clip(d2_inv_v / (np.nanstd(d2_inv_v) + 1e-8), -5, 5)
+    ssn  = np.where(np.isfinite(sl_short),
+                    np.clip(sl_short / (np.nanstd(sl_short) + 1e-8), -5, 5), 0.0)
+    sln  = np.where(np.isfinite(sl_long),
+                    np.clip(sl_long  / (np.nanstd(sl_long)  + 1e-8), -5, 5), 0.0)
+    rstn = roll_std  / (np.nanmax(roll_std)  + 1e-8)
+    rmn  = roll_mean / (np.nanmax(roll_mean) + 1e-8)
+
+    feats = np.column_stack([
+        inv_v_norm, inv_v_log, d1n, d2n, t_F_norm,
+        ssn, sln, rmn, rstn, ratio_roll,
+        pct_from_max, disp_norm, vel_norm, t_elap
+    ]).astype(np.float32)
+
+    return np.nan_to_num(feats, nan=0.0, posinf=5.0, neginf=-5.0)
+
+
+class SelfAttention(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.attn = nn.Linear(hidden_dim, 1)
+
+    def forward(self, x):
+        w = F.softmax(self.attn(x).squeeze(-1), dim=1).unsqueeze(2)
+        return (x * w).sum(dim=1), w.squeeze(2)
+
+
+class FukuzonoLSTM(nn.Module):
+    def __init__(self, n_features=N_FEATURES_FUKU, hidden_dim=128,
+                 n_layers=2, dropout=0.40, bidirectional=True):
+        super().__init__()
+        self.n_dirs = 2 if bidirectional else 1
+        self.hidden_dim = hidden_dim
+        self.input_proj = nn.Sequential(
+            nn.Linear(n_features, hidden_dim), nn.LayerNorm(hidden_dim),
+            nn.GELU(), nn.Dropout(dropout * 0.5)
+        )
+        self.lstm = nn.LSTM(hidden_dim, hidden_dim, n_layers,
+                            batch_first=True,
+                            dropout=dropout if n_layers > 1 else 0.0,
+                            bidirectional=bidirectional)
+        self.lstm_norm = nn.LayerNorm(hidden_dim * self.n_dirs)
+        self.attention  = SelfAttention(hidden_dim * self.n_dirs)
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim * self.n_dirs, 128), nn.LayerNorm(128),
+            nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(128, 64), nn.LayerNorm(64),
+            nn.GELU(), nn.Dropout(dropout * 0.5),
+            nn.Linear(64, 1)
+        )
+
+    def forward(self, x):
+        xp = self.input_proj(x)
+        lo, _ = self.lstm(xp)
+        lo = self.lstm_norm(lo)
+        ctx, attn = self.attention(lo)
+        return self.classifier(ctx).squeeze(-1), ctx
+
+
+def train_fukuzono(inv_v_arr, disp_arr, vel_arr, t_days_arr,
+                   seq_len=20, hidden_dim=128, n_layers=2,
+                   dropout=0.30, bidirectional=True,
+                   lr=1e-3, epochs=300, patience=30,
+                   reg_epochs=200, reg_lr=1e-3,
+                   step_hours=24.0, max_steps=120,
+                   stop_threshold=0.5,
+                   progress_cb=None):
+    """
+    Entrena FukuzonoLSTM completo desde cero (sin pesos previos).
+    Devuelve: pred_train, future_inv_v, future_ts_offsets, metrics, history_loss
+    """
+    torch.manual_seed(42)
+    np.random.seed(42)
+
+    n = len(inv_v_arr)
+    feats_all = engineer_features_fuku(inv_v_arr, disp_arr, vel_arr, t_days_arr)
+
+    seq_len = min(seq_len, max(3, n - 2))
+
+    # Construir ventanas
+    X_list, y_list = [], []
+    for i in range(n - seq_len):
+        X_list.append(feats_all[i: i + seq_len])
+        y_list.append(inv_v_arr[i + seq_len])
+
+    if len(X_list) < 4:
+        raise ValueError(f"Serie demasiado corta ({n} puntos). Necesitas al menos {seq_len + 4}.")
+
+    X_all = torch.tensor(np.array(X_list), dtype=torch.float32).to(DEVICE)
+    y_all = torch.tensor(np.array(y_list), dtype=torch.float32).to(DEVICE)
+
+    y_mean = float(y_all.mean())
+    y_std  = float(y_all.std()) + 1e-8
+    y_scaled = (y_all - y_mean) / y_std
+
+    # Split train/val
+    split = max(2, int(len(X_all) * 0.85))
+    X_tr, y_tr = X_all[:split], y_scaled[:split]
+    X_val, y_val = X_all[split:], y_scaled[split:]
+
+    # ── Modelo completo (entrenamiento end-to-end) ──
+    model = FukuzonoLSTM(n_features=N_FEATURES_FUKU, hidden_dim=hidden_dim,
+                         n_layers=n_layers, dropout=dropout,
+                         bidirectional=bidirectional).to(DEVICE)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=max(10, epochs//8), gamma=0.6)
+    loss_fn   = nn.HuberLoss(delta=0.5)
+
+    history_loss = []
+    best_val = np.inf
+    best_state = None
+    wait = 0
+
+    total_ep = epochs + reg_epochs
+
+    for ep in range(epochs):
+        model.train()
+        optimizer.zero_grad()
+        preds, _ = model(X_tr)
+        loss = loss_fn(preds, y_tr)
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        scheduler.step()
+        history_loss.append(float(loss))
+
+        if len(X_val) > 0:
+            model.eval()
+            with torch.no_grad():
+                vp, _ = model(X_val)
+                val_loss = float(loss_fn(vp, y_val))
         else:
-            decomp_period = None
+            val_loss = float(loss)
 
-    if apply_out and out_order == "Antes del tratamiento":
-        final_signal = apply_outlier_filter(raw_signal, method=out_method,
-            iqr_k=iqr_k, zscore_thr=zscore_thr,
-            clip_min=clip_min, clip_max=clip_max, replace=out_replace)
-        out_label = "Outliers quitados (antes del tratamiento)"
-    else:
-        final_signal = processed_signal.copy()
-        out_label = ""
-
-    if apply_out and out_order == "Después del tratamiento":
-        final_signal = apply_outlier_filter(final_signal, method=out_method,
-            iqr_k=iqr_k, zscore_thr=zscore_thr,
-            clip_min=clip_min, clip_max=clip_max, replace=out_replace)
-        out_label = "Outliers quitados (después del tratamiento)"
-
-    if apply_out:
-        fig_out = go.Figure()
-        fig_out.add_trace(go.Scatter(x=ts_arr, y=raw_signal, mode="lines",
-            name="Raw", line=dict(color=CYAN, width=1, dash="dot"), opacity=0.5))
-        fig_out.add_trace(go.Scatter(x=ts_arr, y=processed_signal, mode="lines",
-            name="Tratada", line=dict(color=ORANGE, width=1.5, dash="dash")))
-        fig_out.add_trace(go.Scatter(x=ts_arr, y=final_signal, mode="lines",
-            name=f"Final ({out_label})", line=dict(color=GREEN, width=2.2)))
-        diff_mask = np.abs(final_signal - raw_signal) > 1e-12
-        if diff_mask.any():
-            fig_out.add_trace(go.Scatter(x=ts_arr[diff_mask], y=raw_signal[diff_mask],
-                mode="markers", name="Outliers detectados",
-                marker=dict(color=PINK, size=7, symbol="x")))
-        fig_out.update_layout(**PLOTLY_LAYOUT,
-            title=dict(text=f"Filtro Outliers — {signal_label}", font=dict(color=CYAN)),
-            xaxis_title="Tiempo (s)", yaxis_title=signal_label, height=300)
-        st.plotly_chart(fig_out, use_container_width=True,
-                        key=f"out_fig_{series_key}")
-
-    if do_decomp:
-        sig_to_decomp = (raw_signal if decomp_on == "Raw (original)" else final_signal)
-        decomp = stl_decompose(sig_to_decomp, ts_arr, period=decomp_period)
-        if decomp:
-            fig_dec = build_decomposition_figure(decomp, title=f"{signal_label}",
-                                                  timestamps=ts_arr)
-            if fig_dec:
-                st.plotly_chart(fig_dec, use_container_width=True,
-                                key=f"decomp_fig_{series_key}")
-            period_used = decomp["period"]
-            st.caption(
-                f"Período detectado/usado: **{period_used}** muestras  |  "
-                f"Varianza residual: {decomp['residual'].var():.6f}  |  "
-                f"Varianza tendencia: {decomp['trend'].var():.6f}"
-            )
+        if val_loss < best_val:
+            best_val = val_loss
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            wait = 0
         else:
-            st.warning("Serie demasiado corta para descomposición.")
+            wait += 1
+            if wait >= patience:
+                break
 
-    return final_signal
+        if progress_cb:
+            progress_cb((ep + 1) / total_ep * 0.6)
+
+    if best_state:
+        model.load_state_dict(best_state)
+
+    # ── Cabeza de regresión fine-tuning (congelar BiLSTM) ──
+    for p in model.lstm.parameters():
+        p.requires_grad = False
+    for p in model.input_proj.parameters():
+        p.requires_grad = False
+
+    reg_head = nn.Sequential(
+        nn.Linear(hidden_dim * (2 if bidirectional else 1), 64),
+        nn.GELU(),
+        nn.Linear(64, 1)
+    ).to(DEVICE)
+
+    opt_reg = torch.optim.Adam(
+        list(reg_head.parameters()) + list(model.attention.parameters()),
+        lr=reg_lr)
+
+    for ep2 in range(reg_epochs):
+        model.eval()
+        reg_head.train()
+        opt_reg.zero_grad()
+        with torch.no_grad():
+            _, emb = model(X_tr)
+        preds_reg = reg_head(emb).squeeze(-1)
+        loss_reg = loss_fn(preds_reg, y_tr)
+        loss_reg.backward()
+        nn.utils.clip_grad_norm_(reg_head.parameters(), 1.0)
+        opt_reg.step()
+        history_loss.append(float(loss_reg))
+        if progress_cb:
+            progress_cb(0.6 + (ep2 + 1) / reg_epochs * 0.35)
+
+    # ── Predicciones en train ──
+    model.eval()
+    reg_head.eval()
+    with torch.no_grad():
+        _, emb_all = model(X_all)
+        preds_all_sc = reg_head(emb_all).squeeze(-1)
+    preds_all_real = (preds_all_sc.cpu().numpy() * y_std + y_mean)
+
+    pred_train = np.full(n, np.nan)
+    for i, pv in enumerate(preds_all_real):
+        pred_train[i + seq_len] = max(0.0, pv)
+
+    # ── Loop autorregresivo ──
+    buf_inv_v = list(inv_v_arr.astype(float))
+    buf_disp  = list(disp_arr.astype(float))
+    buf_vel   = list(vel_arr.astype(float))
+    buf_t     = list(t_days_arr.astype(float))
+
+    future_inv_v = []
+    future_t_off = []  # offsets en días desde el último punto real
+
+    dt_mean = float(np.mean(np.diff(t_days_arr))) if len(t_days_arr) > 1 else step_hours / 24.0
+    step_days = step_hours / 24.0
+
+    with torch.no_grad():
+        for step in range(max_steps):
+            inv_v_buf = np.array(buf_inv_v)
+            disp_buf  = np.array(buf_disp)
+            vel_buf   = np.array(buf_vel)
+            t_buf     = np.array(buf_t)
+
+            feats_buf = engineer_features_fuku(inv_v_buf, disp_buf, vel_buf, t_buf)
+            window = torch.tensor(
+                feats_buf[-seq_len:], dtype=torch.float32
+            ).unsqueeze(0).to(DEVICE)
+
+            _, emb = model(window)
+            pred_sc = float(reg_head(emb).squeeze())
+            next_inv_v = max(0.0, pred_sc * y_std + y_mean)
+
+            next_t   = buf_t[-1] + step_days
+            next_vel = 1.0 / (next_inv_v + 1e-8)
+            next_disp = buf_disp[-1] + next_vel * step_days
+
+            future_inv_v.append(next_inv_v)
+            future_t_off.append(next_t - t_days_arr[-1])
+
+            buf_inv_v.append(next_inv_v)
+            buf_vel.append(next_vel)
+            buf_disp.append(next_disp)
+            buf_t.append(next_t)
+
+            if next_inv_v <= stop_threshold:
+                break
+
+    if progress_cb:
+        progress_cb(1.0)
+
+    # Métricas
+    vm = ~np.isnan(pred_train)
+    real_seg = inv_v_arr[vm]
+    pred_seg = pred_train[vm]
+    mae  = float(np.mean(np.abs(real_seg - pred_seg)))
+    rmse = float(np.sqrt(np.mean((real_seg - pred_seg) ** 2)))
+    mape = float(np.mean(np.abs((real_seg - pred_seg) / (np.abs(real_seg) + 1e-8))) * 100)
+    ss_r = np.sum((real_seg - pred_seg) ** 2)
+    ss_t = np.sum((real_seg - real_seg.mean()) ** 2)
+    r2   = float(1 - ss_r / (ss_t + 1e-12))
+
+    n_params = sum(p.numel() for p in model.parameters()) + \
+               sum(p.numel() for p in reg_head.parameters())
+
+    metrics = dict(MAE=mae, RMSE=rmse, MAPE=mape, R2=r2,
+                   n_params=n_params, epochs_run=len(history_loss),
+                   best_val_loss=best_val,
+                   seq_len=seq_len, hidden_dim=hidden_dim,
+                   n_layers=n_layers, bidirectional=bidirectional)
+
+    return pred_train, np.array(future_inv_v), np.array(future_t_off), metrics, history_loss
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  GRÁFICAS PLOTLY
+#  FIGURAS PLOTLY
 # ════════════════════════════════════════════════════════════════════════════
 
 def build_velocity_figure(timestamps, displacements, processed_disp,
@@ -676,7 +885,7 @@ def build_inverse_velocity_figure(ts_iv, inv_vel_raw, inv_vel_proc):
     fig.add_trace(go.Scatter(x=ts_iv, y=inv_vel_raw, mode="lines", name="1/v Raw",
         line=dict(color="#888", width=1, dash="dot"), opacity=0.5))
     fig.add_trace(go.Scatter(x=ts_iv, y=inv_vel_proc, mode="lines",
-        name="1/v Procesada (→ BiLSTM)", line=dict(color=PINK, width=2.5),
+        name="1/v Procesada (→ LSTM)", line=dict(color=PINK, width=2.5),
         fill="tozeroy", fillcolor="rgba(255,107,157,0.07)"))
     fig.update_layout(**PLOTLY_LAYOUT,
         title=dict(text="Velocidad Inversa (1/v) — proxy de lentitud / estasis",
@@ -685,7 +894,7 @@ def build_inverse_velocity_figure(ts_iv, inv_vel_raw, inv_vel_proc):
     return fig
 
 
-def compute_inv_vel(disp: np.ndarray, timestamps: np.ndarray):
+def compute_inv_vel(disp, timestamps):
     d      = np.abs(np.diff(disp.astype(np.float64)))
     iv     = 1.0 / (d + 1e-9)
     finite = iv[np.isfinite(iv)]
@@ -695,904 +904,69 @@ def compute_inv_vel(disp: np.ndarray, timestamps: np.ndarray):
     return ts_iv, iv
 
 
-def inv_vel_table(ts_iv, inv_vel_raw, inv_vel_proc, label=""):
-    import pandas as pd
-    n = min(len(ts_iv), len(inv_vel_raw), len(inv_vel_proc))
-    return pd.DataFrame({
-        "t (s)":           np.round(ts_iv[:n], 4),
-        "1/v Raw":         np.round(inv_vel_raw[:n], 6),
-        "1/v Procesada":   np.round(inv_vel_proc[:n], 6),
-    })
-
-
-def build_lstm_figure(ts, inv_vel, pred_train, future_vals, metrics, history_loss, horizon,
-                      history_val=None):
-    dt     = float(np.mean(np.diff(ts))) if len(ts) > 1 else 1.0
-    ts_fut = ts[-1] + np.arange(1, horizon + 1) * dt
+def build_fukuzono_figure(ts_real, inv_v_real, pred_train,
+                           future_t_off, future_inv_v,
+                           metrics, history_loss,
+                           stop_threshold=0.5):
+    """Figura principal Fukuzono: histórico + ajuste + proyección autorregresiva."""
+    ts_fut = ts_real[-1] + future_t_off
     rmse   = metrics["RMSE"]
-    fig = make_subplots(rows=1, cols=2, column_widths=[0.65, 0.35],
-                        subplot_titles=["Serie real + pronóstico BiLSTM", "Curva de pérdida"])
-    fig.add_trace(go.Scatter(x=ts, y=inv_vel, mode="lines", name="Real",
-        line=dict(color=PINK, width=2)), row=1, col=1)
+
+    fig = make_subplots(rows=1, cols=2, column_widths=[0.68, 0.32],
+                        subplot_titles=["Serie real + proyección autorregresiva FukuzonoLSTM",
+                                        "Curva de pérdida"])
+
+    # Serie real
+    fig.add_trace(go.Scatter(x=ts_real, y=inv_v_real, mode="lines",
+        name="1/v real", line=dict(color=PINK, width=2.2)), row=1, col=1)
+
+    # Reconstrucción train
     vm = ~np.isnan(pred_train)
     if vm.any():
-        fig.add_trace(go.Scatter(x=ts[vm], y=pred_train[vm], mode="lines",
-            name="Reconstrucción BiLSTM",
-            line=dict(color=YELLOW, width=1.8, dash="dash")), row=1, col=1)
-    fig.add_trace(go.Scatter(
-        x=np.concatenate([ts_fut, ts_fut[::-1]]),
-        y=np.concatenate([future_vals + rmse, (future_vals - rmse)[::-1]]),
-        fill="toself", fillcolor="rgba(63,185,80,0.15)",
-        line=dict(color="rgba(0,0,0,0)"),
-        name=f"±1 RMSE ({rmse:.4f})", showlegend=True), row=1, col=1)
-    fig.add_trace(go.Scatter(x=ts_fut, y=future_vals, mode="lines+markers",
-        name=f"Pronóstico (+{horizon} pasos)",
-        line=dict(color=GREEN, width=2.2), marker=dict(size=6)), row=1, col=1)
-    fig.add_vline(x=float(ts[-1]), line_dash="dot", line_color=BORDER, row=1, col=1)
-    fig.add_trace(go.Scatter(y=history_loss, mode="lines", name="Loss entrenamiento",
-        line=dict(color=CYAN, width=1.8)), row=1, col=2)
-    if history_val:
-        fig.add_trace(go.Scatter(y=history_val, mode="lines", name="Loss validación",
-            line=dict(color=PINK, width=1.8)), row=1, col=2)
-    fig.update_layout(**PLOTLY_LAYOUT,
-        title=dict(text="Predicción BiLSTM Bidireccional — Velocidad Inversa",
-                   font=dict(color=CYAN, size=14)), height=420)
-    fig.update_yaxes(title_text="1/(px/frame)", row=1, col=1)
-    fig.update_xaxes(title_text="Tiempo (s)", row=1, col=1)
-    fig.update_yaxes(title_text="MSE (log)", type="log", row=1, col=2)
-    fig.update_xaxes(title_text="Epoch", row=1, col=2)
-    for ann in fig["layout"]["annotations"]:
-        ann["font"] = dict(color="#cdd9e5", size=12)
-    return fig
+        fig.add_trace(go.Scatter(x=ts_real[vm], y=pred_train[vm], mode="lines",
+            name="Ajuste LSTM (train)", line=dict(color=YELLOW, width=1.8, dash="dash")),
+            row=1, col=1)
 
+    # Banda ±RMSE
+    if len(future_inv_v) > 0:
+        fig.add_trace(go.Scatter(
+            x=np.concatenate([ts_fut, ts_fut[::-1]]),
+            y=np.concatenate([future_inv_v + rmse, (future_inv_v - rmse)[::-1]]),
+            fill="toself", fillcolor="rgba(63,185,80,0.15)",
+            line=dict(color="rgba(0,0,0,0)"),
+            name=f"±1 RMSE ({rmse:.3f})", showlegend=True), row=1, col=1)
 
-# ════════════════════════════════════════════════════════════════════════════
-#  FEATURE ENGINEERING
-# ════════════════════════════════════════════════════════════════════════════
+        # Proyección futura
+        fig.add_trace(go.Scatter(x=ts_fut, y=future_inv_v, mode="lines+markers",
+            name="Proyección autorregresiva",
+            line=dict(color=GREEN, width=2.2), marker=dict(size=5)), row=1, col=1)
 
-def build_features(series: np.ndarray, lookback: int) -> np.ndarray:
-    n  = len(series)
-    mn = series.min()
-    mx = series.max()
-    rng = mx - mn if mx != mn else 1.0
-    s   = (series - mn) / rng
+        # Punto de falla proyectado
+        fig.add_vline(x=float(ts_fut[-1]), line_dash="dot", line_color="red",
+                      annotation_text=f"Falla proyectada<br>t={ts_fut[-1]:.1f}s",
+                      annotation_font_color="red", row=1, col=1)
 
-    eps = 1e-9
-    velocity     = 1.0 / (s + eps)
-    d_inv_vel    = np.concatenate([[0.0], np.diff(s)])
-    acceleration = np.concatenate([[0.0], np.diff(velocity)])
-    jerk         = np.concatenate([[0.0], np.diff(acceleration)])
+    # Línea de corte
+    fig.add_hline(y=stop_threshold, line_dash="dot", line_color=BORDER,
+                  annotation_text=f"umbral={stop_threshold}", row=1, col=1)
 
-    log_inv_vel   = np.log(np.abs(s)       + eps)
-    log_velocity  = np.log(np.abs(velocity) + eps)
-    log_accel_abs = np.log(np.abs(acceleration) + eps)
+    # Separación histórico / proyección
+    fig.add_vline(x=float(ts_real[-1]), line_dash="dot", line_color=BORDER, row=1, col=1)
 
-    def _ewm(x, alpha):
-        out = np.empty_like(x)
-        out[0] = x[0]
-        for i in range(1, len(x)):
-            out[i] = alpha * x[i] + (1 - alpha) * out[i - 1]
-        return out
-
-    ewm_fast = _ewm(s, 0.3)
-    ewm_slow = _ewm(s, 0.05)
-    ewm_ratio = ewm_fast / (ewm_slow + eps)
-
-    def _roll_stat(x, w):
-        pad = np.pad(x, (w - 1, 0), mode='edge')
-        wins = np.lib.stride_tricks.sliding_window_view(pad, w)
-        return wins.mean(axis=1), wins.std(axis=1)
-
-    rmean5, rstd5 = _roll_stat(s, 5)
-    rstd5_norm    = rstd5 / (rmean5 + eps)
-    residual_tr   = s - rmean5
-    slope_angle = np.arctan(d_inv_vel / (1.0 / n + eps))
-
-    feats = np.stack([
-        s, velocity, d_inv_vel, acceleration, jerk,
-        log_inv_vel, log_velocity, log_accel_abs,
-        ewm_fast, ewm_slow, ewm_ratio,
-        rmean5, rstd5, rstd5_norm, residual_tr, slope_angle,
-    ], axis=1)
-
-    feats = np.clip(feats, -1e6, 1e6)
-
-    M      = n - lookback
-    x_lin  = np.arange(lookback, dtype=np.float64)
-    x_mean = x_lin.mean()
-    x_var  = ((x_lin - x_mean) ** 2).sum()
-
-    s_wins = np.lib.stride_tricks.sliding_window_view(
-        s.astype(np.float64), lookback)[:M]
-
-    y_mean = s_wins.mean(axis=1, keepdims=True)
-    slopes = ((s_wins - y_mean) * (x_lin - x_mean)).sum(axis=1) / x_var
-
-    Vander = np.stack([x_lin**2, x_lin, np.ones(lookback)], axis=1)
-    pinv_V = np.linalg.pinv(Vander)
-    curvs  = (pinv_V @ s_wins.T)[0]
-
-    row_idx  = np.arange(M)[:, None] + np.arange(lookback)[None, :]
-    feat_wins = feats[row_idx]
-
-    slope_feat = np.repeat(slopes[:, None], lookback, axis=1).astype(np.float32)
-    curv_feat  = np.repeat(curvs[:, None],  lookback, axis=1).astype(np.float32)
-    extra = np.stack([slope_feat, curv_feat], axis=2)
-
-    X = np.concatenate([feat_wins, extra], axis=2).astype(np.float32)
-    y = s[lookback:].astype(np.float32)
-
-    return X, y, mn, rng
-
-
-N_FEATURES = 18
-
-# ════════════════════════════════════════════════════════════════════════════
-#  MODELO HÍBRIDO
-# ════════════════════════════════════════════════════════════════════════════
-
-def fit_trend(series: np.ndarray, trend_type: str = "auto"):
-    from scipy.optimize import curve_fit
-
-    n = len(series)
-    x = np.arange(n, dtype=np.float64)
-    y = series.astype(np.float64)
-    results = {}
-
-    def exp_func(x, a, b, c):
-        return a * np.exp(np.clip(b * x, -30, 30)) + c
-
-    try:
-        p0_exp = [y[0] - y[-1], -3.0 / n, y[-1]]
-        popt_e, _ = curve_fit(exp_func, x, y, p0=p0_exp, maxfev=8000,
-                               bounds=([-np.inf, -10/n, -np.inf],
-                                       [np.inf,   0,     np.inf]))
-        fitted_e = exp_func(x, *popt_e)
-        ss_res = np.sum((y - fitted_e)**2)
-        ss_tot = np.sum((y - y.mean())**2)
-        r2_e = 1 - ss_res / (ss_tot + 1e-12)
-        results["exponential"] = dict(r2=r2_e, params=popt_e, fitted=fitted_e,
-            fn=lambda xf, p=popt_e: exp_func(xf, *p))
-    except Exception:
-        pass
-
-    def power_func(x, a, b, c):
-        return a * np.power(np.clip(x + 1, 1e-6, None), b) + c
-
-    try:
-        p0_pw = [y[0], -0.5, y[-1]]
-        popt_pw, _ = curve_fit(power_func, x, y, p0=p0_pw, maxfev=8000)
-        fitted_pw = power_func(x, *popt_pw)
-        ss_res = np.sum((y - fitted_pw)**2)
-        r2_pw = 1 - ss_res / (np.sum((y - y.mean())**2) + 1e-12)
-        results["power"] = dict(r2=r2_pw, params=popt_pw, fitted=fitted_pw,
-            fn=lambda xf, p=popt_pw: power_func(xf, *p))
-    except Exception:
-        pass
-
-    def logistic_func(x, a, b, c, d):
-        return a / (1.0 + np.exp(np.clip(b * (x - c), -30, 30))) + d
-
-    try:
-        p0_lg = [y[0] - y[-1], 6.0 / n, n * 0.8, y[-1]]
-        popt_lg, _ = curve_fit(logistic_func, x, y, p0=p0_lg, maxfev=10000,
-                                bounds=([0, 0, 0, -np.inf],
-                                        [np.inf, np.inf, n*2, np.inf]))
-        fitted_lg = logistic_func(x, *popt_lg)
-        ss_res = np.sum((y - fitted_lg)**2)
-        r2_lg = 1 - ss_res / (np.sum((y - y.mean())**2) + 1e-12)
-        results["logistic"] = dict(r2=r2_lg, params=popt_lg, fitted=fitted_lg,
-            fn=lambda xf, p=popt_lg: logistic_func(xf, *p))
-    except Exception:
-        pass
-
-    coeffs = np.polyfit(x, y, 3)
-    fitted_poly = np.polyval(coeffs, x)
-    ss_res = np.sum((y - fitted_poly)**2)
-    r2_poly = 1 - ss_res / (np.sum((y - y.mean())**2) + 1e-12)
-    results["polynomial"] = dict(r2=r2_poly, params=coeffs, fitted=fitted_poly,
-        fn=lambda xf, c=coeffs: np.polyval(c, xf))
-
-    if trend_type == "auto":
-        best_key = max(results, key=lambda k: results[k]["r2"])
-    elif trend_type in results:
-        best_key = trend_type
-    else:
-        best_key = "polynomial"
-
-    best = results[best_key]
-    residual = y - best["fitted"]
-
-    return dict(trend_vals=best["fitted"], residual=residual,
-                forecast_fn=best["fn"], trend_type=best_key,
-                r2=best["r2"], all_r2={k: v["r2"] for k, v in results.items()},
-                x_end=float(n - 1))
-
-
-def train_hybrid(series: np.ndarray, lookback: int = 15, horizon: int = 5,
-                 hidden_dim: int = 48, n_layers: int = 1, dropout: float = 0.0,
-                 bidirectional: bool = True, lr: float = 1e-3, epochs: int = 150,
-                 batch_size: int = 1, weight_decay: float = 1e-4, patience: int = 20,
-                 scheduler_step: int = 30, scheduler_gamma: float = 0.5,
-                 trend_type: str = "auto"):
-    n = len(series)
-    trend_info = fit_trend(series, trend_type=trend_type)
-    trend_vals = trend_info["trend_vals"]
-    residual   = trend_info["residual"]
-
-    res_pred_full, res_future, res_metrics, history_loss, history_val = train_bilstm(
-        residual, lookback=lookback, horizon=horizon,
-        hidden_dim=hidden_dim, n_layers=n_layers,
-        dropout=dropout, bidirectional=bidirectional,
-        lr=lr, epochs=epochs, batch_size=batch_size,
-        weight_decay=weight_decay, patience=patience,
-        scheduler_step=scheduler_step, scheduler_gamma=scheduler_gamma)
-
-    pred_full = res_pred_full.copy()
-    valid_mask = ~np.isnan(pred_full)
-    pred_full[valid_mask] = pred_full[valid_mask] + trend_vals[valid_mask]
-
-    x_future = trend_info["x_end"] + np.arange(1, horizon + 1)
-    trend_future = trend_info["forecast_fn"](x_future)
-    future_vals = res_future + trend_future
-
-    real_seg  = series[valid_mask]
-    pred_seg  = pred_full[valid_mask]
-    mae  = float(np.mean(np.abs(real_seg - pred_seg)))
-    rmse = float(np.sqrt(np.mean((real_seg - pred_seg)**2)))
-    mape = float(np.mean(np.abs((real_seg - pred_seg) / (np.abs(real_seg) + 1e-8))) * 100)
-    ss_r = np.sum((real_seg - pred_seg)**2)
-    ss_t = np.sum((real_seg - real_seg.mean())**2)
-    r2   = float(1 - ss_r / (ss_t + 1e-12))
-
-    metrics = dict(MAE=mae, RMSE=rmse, MAPE=mape, R2=r2,
-                   n_params=res_metrics["n_params"], epochs_run=res_metrics["epochs_run"],
-                   best_val_loss=res_metrics["best_val_loss"],
-                   lookback=lookback, horizon=horizon, hidden_dim=hidden_dim,
-                   n_layers=n_layers, bidirectional=bidirectional, dropout=dropout, lr=lr,
-                   trend_type=trend_info["trend_type"], trend_r2=trend_info["r2"])
-
-    return pred_full, future_vals, metrics, history_loss, history_val, trend_info
-
-
-def build_hybrid_figure(ts, series, pred_full, future_vals, trend_info,
-                        metrics, history_loss, horizon, history_val=None):
-    dt     = float(np.mean(np.diff(ts))) if len(ts) > 1 else 1.0
-    ts_fut = ts[-1] + np.arange(1, horizon + 1) * dt
-    rmse   = metrics["RMSE"]
-    trend  = trend_info["trend_vals"]
-
-    fig = make_subplots(rows=2, cols=2,
-        subplot_titles=["Serie real + pronóstico híbrido", "Curva de pérdida (residuo)",
-                        "Tendencia paramétrica ajustada", "Residuo real vs. predicho (BiLSTM)"],
-        vertical_spacing=0.14, horizontal_spacing=0.10)
-
-    fig.add_trace(go.Scatter(x=ts, y=series, mode="lines", name="Real",
-        line=dict(color=PINK, width=2)), row=1, col=1)
-    vm = ~np.isnan(pred_full)
-    if vm.any():
-        fig.add_trace(go.Scatter(x=ts[vm], y=pred_full[vm], mode="lines",
-            name="Reconstrucción híbrida",
-            line=dict(color=YELLOW, width=1.8, dash="dash")), row=1, col=1)
-    fig.add_trace(go.Scatter(
-        x=np.concatenate([ts_fut, ts_fut[::-1]]),
-        y=np.concatenate([future_vals + rmse, (future_vals - rmse)[::-1]]),
-        fill="toself", fillcolor="rgba(63,185,80,0.18)",
-        line=dict(color="rgba(0,0,0,0)"),
-        name=f"±1 RMSE ({rmse:.4f})", showlegend=True), row=1, col=1)
-    fig.add_trace(go.Scatter(x=ts_fut, y=future_vals, mode="lines+markers",
-        name=f"Pronóstico híbrido (+{horizon} pasos)",
-        line=dict(color=GREEN, width=2.4), marker=dict(size=7, symbol="diamond")), row=1, col=1)
-    fig.add_vline(x=float(ts[-1]), line_dash="dot", line_color=BORDER, row=1, col=1)
-
-    fig.add_trace(go.Scatter(y=history_loss, mode="lines", name="Loss entrenamiento",
+    # Curva de pérdida
+    fig.add_trace(go.Scatter(y=history_loss, mode="lines", name="Loss",
         line=dict(color=CYAN, width=1.8), showlegend=True), row=1, col=2)
-    if history_val:
-        fig.add_trace(go.Scatter(y=history_val, mode="lines", name="Loss validación",
-            line=dict(color=PINK, width=1.8), showlegend=True), row=1, col=2)
-
-    fig.add_trace(go.Scatter(x=ts, y=series, mode="lines", name="Serie real",
-        line=dict(color=PINK, width=1.5, dash="dot"), opacity=0.5,
-        showlegend=False), row=2, col=1)
-    fig.add_trace(go.Scatter(x=ts, y=trend, mode="lines",
-        name=f"Tendencia ({trend_info['trend_type']}, R²={trend_info['r2']:.3f})",
-        line=dict(color=ORANGE, width=2.5)), row=2, col=1)
-    fig.add_trace(go.Scatter(
-        x=ts_fut, y=trend_info["forecast_fn"](trend_info["x_end"] + np.arange(1, horizon + 1)),
-        mode="lines", name="Tendencia extrapolada",
-        line=dict(color=ORANGE, width=1.8, dash="dash"), showlegend=False), row=2, col=1)
-
-    residual = trend_info["residual"]
-    fig.add_trace(go.Scatter(x=ts, y=residual, mode="lines", name="Residuo real",
-        line=dict(color="#c678dd", width=1.5)), row=2, col=2)
-    if vm.any():
-        res_pred = pred_full[vm] - trend[vm]
-        fig.add_trace(go.Scatter(x=ts[vm], y=res_pred, mode="lines",
-            name="Residuo predicho (BiLSTM)",
-            line=dict(color=YELLOW, width=1.5, dash="dash")), row=2, col=2)
-    fig.add_hline(y=0, line_dash="dot", line_color=BORDER, row=2, col=2)
 
     fig.update_layout(**PLOTLY_LAYOUT,
-        title=dict(text=f"Modelo Híbrido — Tendencia {trend_info['trend_type']} + BiLSTM residuo",
-                   font=dict(color=CYAN, size=14)), height=620)
-    for r, c, yt, xt in [(1,1,"1/(px/frame)","Tiempo (s)"), (1,2,"MSE (log)","Epoch"),
-                          (2,1,"1/(px/frame)","Tiempo (s)"), (2,2,"Residuo","Tiempo (s)")]:
-        fig.update_yaxes(title_text=yt, row=r, col=c, gridcolor=BORDER)
-        fig.update_xaxes(title_text=xt, row=r, col=c, gridcolor=BORDER)
-    fig.update_yaxes(type="log", row=1, col=2)
+        title=dict(text="FukuzonoLSTM — Predicción Autorregresiva (1/v → 0)",
+                   font=dict(color=CYAN, size=14)), height=440)
+    fig.update_yaxes(title_text="1/v", row=1, col=1, gridcolor=BORDER)
+    fig.update_xaxes(title_text="Tiempo (s)", row=1, col=1, gridcolor=BORDER)
+    fig.update_yaxes(title_text="Loss (log)", type="log", row=1, col=2, gridcolor=BORDER)
+    fig.update_xaxes(title_text="Epoch", row=1, col=2, gridcolor=BORDER)
     for ann in fig["layout"]["annotations"]:
         ann["font"] = dict(color="#cdd9e5", size=11)
     return fig
-
-
-# ════════════════════════════════════════════════════════════════════════════
-#  MODELO BiLSTM — NumPy puro con BPTT real + Adam
-# ════════════════════════════════════════════════════════════════════════════
-
-def _sigmoid(x):
-    return np.where(x >= 0,
-                    1.0 / (1.0 + np.exp(-np.clip(x, -30, 30))),
-                    np.exp(np.clip(x, -30, 30)) / (1.0 + np.exp(np.clip(x, -30, 30))))
-
-def _tanh(x):    return np.tanh(np.clip(x, -15, 15))
-def _dsigmoid(s): return s * (1.0 - s)
-def _dtanh(t):    return 1.0 - t ** 2
-
-def _xavier(n_in, n_out, rng):
-    lim = np.sqrt(6.0 / (n_in + n_out))
-    return rng.uniform(-lim, lim, (n_in, n_out)).astype(np.float64)
-
-def _huber_loss_and_grad(pred, target, delta=0.5):
-    r = pred - target
-    abs_r = np.abs(r)
-    loss  = np.where(abs_r <= delta, 0.5 * r**2, delta * (abs_r - 0.5 * delta))
-    grad  = np.where(abs_r <= delta, r, delta * np.sign(r))
-    return float(loss.mean()), grad / len(pred)
-
-
-class _AdamVar:
-    def __init__(self, shape, lr=1e-3, b1=0.9, b2=0.999, eps=1e-8, wd=0.0):
-        self.lr  = lr; self.b1 = b1; self.b2 = b2
-        self.eps = eps; self.wd = wd
-        self.m   = np.zeros(shape, np.float64)
-        self.v   = np.zeros(shape, np.float64)
-        self.t   = 0
-
-    def step(self, w, g):
-        self.t += 1
-        g = g + self.wd * w
-        self.m = self.b1 * self.m + (1 - self.b1) * g
-        self.v = self.b2 * self.v + (1 - self.b2) * g**2
-        mh = self.m / (1 - self.b1**self.t)
-        vh = self.v / (1 - self.b2**self.t)
-        return w - self.lr * mh / (np.sqrt(vh) + self.eps)
-
-
-class _LSTMCell:
-    def __init__(self, input_dim, hidden, rng, lr, wd):
-        self.H = hidden
-        self.W  = _xavier(input_dim + hidden, 4 * hidden, rng)
-        self.b  = np.zeros(4 * hidden, np.float64)
-        self.aW = _AdamVar(self.W.shape, lr=lr, wd=wd)
-        self.ab = _AdamVar(self.b.shape, lr=lr, wd=wd)
-
-    def forward(self, x_seq):
-        T = len(x_seq); H = self.H
-        h = np.zeros(H, np.float64)
-        c = np.zeros(H, np.float64)
-        hs, cs, gates_pre, gates_post, xhs = [], [], [], [], []
-        for t in range(T):
-            xh  = np.concatenate([x_seq[t], h])
-            g   = xh @ self.W + self.b
-            i_  = _sigmoid(g[:H]);      f_  = _sigmoid(g[H:2*H])
-            o_  = _sigmoid(g[2*H:3*H]); g_  = _tanh(g[3*H:])
-            c_n = f_ * c + i_ * g_
-            h_n = o_ * _tanh(c_n)
-            gates_pre.append(g);     gates_post.append((i_, f_, o_, g_))
-            cs.append(c.copy());     hs.append(h_n)
-            xhs.append(xh)
-            h = h_n; c = c_n
-        return np.array(hs), (xhs, gates_pre, gates_post, cs, np.array(hs))
-
-    def backward(self, dh_seq, cache):
-        xhs, gates_pre, gates_post, cs_list, hs = cache
-        T = len(dh_seq); H = self.H
-        dW = np.zeros_like(self.W); db = np.zeros_like(self.b)
-        dh_next = np.zeros(H, np.float64)
-        dc_next = np.zeros(H, np.float64)
-        dX = np.zeros((T, xhs[0].shape[0] - H), np.float64)
-        for t in reversed(range(T)):
-            dh = dh_seq[t] + dh_next
-            i_, f_, o_, g_ = gates_post[t]
-            c_prev = cs_list[t]
-            c_cur  = f_ * c_prev + i_ * g_
-            tc     = _tanh(c_cur)
-            do  = dh * tc
-            dc  = dh * o_ * _dtanh(tc) + dc_next
-            df  = dc * c_prev
-            di  = dc * g_
-            dg  = dc * i_
-            dg_pre = np.concatenate([
-                di * _dsigmoid(i_), df * _dsigmoid(f_),
-                do * _dsigmoid(o_), dg * _dtanh(g_)])
-            dxh = dg_pre @ self.W.T
-            dW += np.outer(xhs[t], dg_pre)
-            db += dg_pre
-            dX[t]    = dxh[:xhs[t].shape[0] - H]
-            dh_next  = dxh[xhs[t].shape[0] - H:]
-            dc_next  = dc * f_
-        for arr in [dW, db]:
-            np.clip(arr, -1.0, 1.0, out=arr)
-        self.W = self.aW.step(self.W, dW)
-        self.b = self.ab.step(self.b, db)
-        return dX
-
-
-class _DenseLayer:
-    def __init__(self, n_in, n_out, rng, lr, wd, activation="linear"):
-        self.W    = _xavier(n_in, n_out, rng)
-        self.b    = np.zeros(n_out, np.float64)
-        self.act  = activation
-        self.aW   = _AdamVar(self.W.shape, lr=lr, wd=wd)
-        self.ab   = _AdamVar(self.b.shape, lr=lr, wd=wd)
-        self._last_x = None; self._last_z = None
-
-    def forward(self, x):
-        self._last_x = x.copy()
-        z = x @ self.W + self.b
-        self._last_z = z.copy()
-        if self.act == "relu":   return np.maximum(0, z)
-        if self.act == "tanh":   return _tanh(z)
-        return z
-
-    def backward(self, dout):
-        if self.act == "relu":  dout = dout * (self._last_z > 0)
-        elif self.act == "tanh": dout = dout * _dtanh(_tanh(self._last_z))
-        dW = np.outer(self._last_x, dout)
-        np.clip(dW, -1.0, 1.0, out=dW)
-        np.clip(dout, -1.0, 1.0, out=dout)
-        self.W = self.aW.step(self.W, dW)
-        self.b = self.ab.step(self.b, dout)
-        return dout @ self.W.T
-
-
-def train_bilstm(series: np.ndarray, lookback: int = 15, horizon: int = 5,
-                 hidden_dim: int = 48, n_layers: int = 1, dropout: float = 0.0,
-                 bidirectional: bool = True, lr: float = 1e-3, epochs: int = 150,
-                 batch_size: int = 1, weight_decay: float = 1e-4, patience: int = 20,
-                 scheduler_step: int = 30, scheduler_gamma: float = 0.5):
-    rng_np = np.random.RandomState(42)
-    X, y_all, mn_s, rng_s = build_features(series, lookback)
-    X = X.astype(np.float64); y_all = y_all.astype(np.float64)
-    N = len(X)
-    if N < 6:
-        raise ValueError(f"Serie demasiado corta ({len(series)} puntos). "
-                         f"Necesitas al menos {lookback + 6} puntos.")
-    split  = max(2, int(N * 0.8))
-    Xtr, ytr = X[:split], y_all[:split]
-    Xte, yte = X[split:], y_all[split:]
-    inp_dim  = N_FEATURES
-    n_dirs   = 2 if bidirectional else 1
-    lstm_out = hidden_dim * n_dirs
-    lstm_fwd = _LSTMCell(inp_dim, hidden_dim, rng_np, lr, weight_decay)
-    lstm_bwd = _LSTMCell(inp_dim, hidden_dim, rng_np, lr, weight_decay) if bidirectional else None
-    proj1    = _DenseLayer(lstm_out, max(32, lstm_out // 2), rng_np, lr, weight_decay, "relu")
-    proj2    = _DenseLayer(max(32, lstm_out // 2), 1, rng_np, lr, weight_decay, "linear")
-    n_params = (lstm_fwd.W.size + lstm_fwd.b.size) * n_dirs + \
-               proj1.W.size + proj1.b.size + proj2.W.size + proj2.b.size
-
-    def _forward(x_seq):
-        h_f, cache_f = lstm_fwd.forward(x_seq)
-        if bidirectional:
-            h_b, cache_b = lstm_bwd.forward(x_seq[::-1])
-            h_b = h_b[::-1]
-            context = np.concatenate([h_f[-1], h_b[-1]])
-        else:
-            context = h_f[-1]; cache_b = None
-        h1 = proj1.forward(context)
-        out = proj2.forward(h1)
-        return float(out[0]), (cache_f, cache_b, context, h1)
-
-    def _backward(dy, caches):
-        cache_f, cache_b, context, h1 = caches
-        dout = np.array([dy], np.float64)
-        dh1  = proj2.backward(dout)
-        dc   = proj1.backward(dh1)
-        if bidirectional:
-            dc_f = dc[:hidden_dim]; dc_b = dc[hidden_dim:]
-            dh_f = np.zeros((len(cache_f[0]), hidden_dim), np.float64)
-            dh_b = np.zeros((len(cache_b[0]), hidden_dim), np.float64)
-            dh_f[-1] = dc_f; dh_b[-1] = dc_b
-            lstm_fwd.backward(dh_f, cache_f)
-            lstm_bwd.backward(dh_b[::-1], cache_b)
-        else:
-            dh_f = np.zeros((len(cache_f[0]), hidden_dim), np.float64)
-            dh_f[-1] = dc
-            lstm_fwd.backward(dh_f, cache_f)
-
-    history_loss = []; history_val = []
-    best_val = np.inf; best_W = None; wait_es = 0; current_lr = lr
-
-    for ep in range(epochs):
-        if ep > 0 and ep % scheduler_step == 0:
-            current_lr *= scheduler_gamma
-            for obj in [lstm_fwd, lstm_bwd, proj1, proj2]:
-                if obj is None: continue
-                for av in (obj.aW, obj.ab) if hasattr(obj, 'aW') else []:
-                    av.lr = current_lr
-        idx_shuf = rng_np.permutation(len(Xtr))
-        ep_loss  = 0.0
-        _bs = max(1, min(batch_size, len(Xtr)))
-        for b_start in range(0, len(Xtr), _bs):
-            b_idx = idx_shuf[b_start: b_start + _bs]
-            for i in b_idx:
-                pred, caches = _forward(Xtr[i])
-                loss, dy = _huber_loss_and_grad(np.array([pred]), np.array([ytr[i]]))
-                _backward(float(dy[0]), caches)
-                ep_loss += loss
-        history_loss.append(ep_loss / len(Xtr))
-        if len(Xte) > 0:
-            val_preds = np.array([_forward(Xte[j])[0] for j in range(len(Xte))])
-            val_loss, _ = _huber_loss_and_grad(val_preds, yte)
-        else:
-            val_loss = history_loss[-1]
-        history_val.append(float(val_loss))
-        if val_loss < best_val:
-            best_val = val_loss
-            best_W = {
-                'fW': lstm_fwd.W.copy(), 'fb': lstm_fwd.b.copy(),
-                'bW': lstm_bwd.W.copy() if bidirectional else None,
-                'bb': lstm_bwd.b.copy() if bidirectional else None,
-                'p1W': proj1.W.copy(), 'p1b': proj1.b.copy(),
-                'p2W': proj2.W.copy(), 'p2b': proj2.b.copy(),
-            }
-            wait_es = 0
-        else:
-            wait_es += 1
-            if wait_es >= patience:
-                break
-
-    if best_W:
-        lstm_fwd.W = best_W['fW']; lstm_fwd.b = best_W['fb']
-        if bidirectional: lstm_bwd.W = best_W['bW']; lstm_bwd.b = best_W['bb']
-        proj1.W = best_W['p1W'];  proj1.b = best_W['p1b']
-        proj2.W = best_W['p2W'];  proj2.b = best_W['p2b']
-
-    denorm = lambda v: float(v) * rng_s + mn_s
-
-    tr_pred = np.array([_forward(Xtr[i])[0] for i in range(len(Xtr))])
-    te_pred = np.array([_forward(Xte[i])[0] for i in range(len(Xte))]) if len(Xte) else np.array([])
-
-    pred_full = np.full(len(series), np.nan)
-    for i, pv in enumerate(tr_pred):
-        pred_full[i + lookback] = denorm(pv)
-    for i, pv in enumerate(te_pred):
-        pred_full[split + i + lookback] = denorm(pv)
-
-    s_full = ((series - mn_s) / rng_s).astype(np.float64)
-
-    def _win_features(buf_norm):
-        arr  = np.array(buf_norm, np.float64)
-        n_   = len(arr)
-        eps_ = 1e-9
-        velocity_   = 1.0 / (arr + eps_)
-        d_inv_vel_  = np.concatenate([[0.0], np.diff(arr)])
-        accel_      = np.concatenate([[0.0], np.diff(velocity_)])
-        jerk_       = np.concatenate([[0.0], np.diff(accel_)])
-        log_iv_     = np.log(np.abs(arr)        + eps_)
-        log_vel_    = np.log(np.abs(velocity_)  + eps_)
-        log_acc_    = np.log(np.abs(accel_)     + eps_)
-        def _ewm_(x, a):
-            o = np.empty_like(x); o[0] = x[0]
-            for k in range(1, len(x)): o[k] = a*x[k] + (1-a)*o[k-1]
-            return o
-        ewm_f_ = _ewm_(arr, 0.3)
-        ewm_s_ = _ewm_(arr, 0.05)
-        ewm_r_ = ewm_f_ / (ewm_s_ + eps_)
-        w5 = min(5, n_)
-        _p5 = np.pad(arr, (w5-1, 0), mode='edge')
-        _wins5 = np.lib.stride_tricks.sliding_window_view(_p5, w5)
-        rm5_  = _wins5.mean(axis=1)
-        rs5_  = _wins5.std(axis=1)
-        rs5n_ = rs5_ / (rm5_ + eps_)
-        res_  = arr - rm5_
-        sa_   = np.arctan(d_inv_vel_ / (1.0/n_ + eps_))
-        x_lin_ = np.arange(n_, dtype=np.float64)
-        slope_iv_ = float(np.polyfit(x_lin_, arr, 1)[0])
-        curv_iv_  = float(np.polyfit(x_lin_, arr, 2)[0])
-        base = np.stack([arr, velocity_, d_inv_vel_, accel_, jerk_,
-                         log_iv_, log_vel_, log_acc_,
-                         ewm_f_, ewm_s_, ewm_r_,
-                         rm5_, rs5_, rs5n_, res_, sa_], axis=1)
-        extra = np.column_stack([np.full(n_, slope_iv_), np.full(n_, curv_iv_)])
-        result = np.concatenate([base, extra], axis=1)
-        return np.clip(result, -1e6, 1e6).astype(np.float64)
-
-    win_buf = list(s_full[-lookback:])
-    future_raw = []
-    for _ in range(horizon):
-        feat_win = _win_features(win_buf[-lookback:])
-        nxt, _   = _forward(feat_win)
-        future_raw.append(nxt)
-        win_buf.append(nxt)
-
-    future_vals = np.array([denorm(v) for v in future_raw])
-
-    if len(te_pred) > 0:
-        real_d = np.array([denorm(v) for v in yte])
-        pred_d = np.array([denorm(v) for v in te_pred])
-    else:
-        real_d = np.array([denorm(v) for v in ytr])
-        pred_d = np.array([denorm(v) for v in tr_pred])
-
-    mae  = float(np.mean(np.abs(real_d - pred_d)))
-    rmse = float(np.sqrt(np.mean((real_d - pred_d)**2)))
-    mape = float(np.mean(np.abs((real_d - pred_d) / (np.abs(real_d)+1e-8))) * 100)
-    ss_r = np.sum((real_d - pred_d)**2)
-    ss_t = np.sum((real_d - real_d.mean())**2)
-    r2   = float(1 - ss_r / (ss_t + 1e-12))
-
-    metrics = dict(MAE=mae, RMSE=rmse, MAPE=mape, R2=r2,
-                   n_params=n_params, epochs_run=len(history_loss),
-                   best_val_loss=float(best_val),
-                   lookback=lookback, horizon=horizon, hidden_dim=hidden_dim,
-                   n_layers=n_layers, bidirectional=bidirectional, dropout=dropout, lr=lr)
-
-    return pred_full, future_vals, metrics, history_loss, history_val
-
-
-# ════════════════════════════════════════════════════════════════════════════
-#  WALK-FORWARD VALIDATION
-# ════════════════════════════════════════════════════════════════════════════
-
-def walk_forward_validation(series: np.ndarray, lookback: int = 15, horizon: int = 5,
-                             hidden_dim: int = 48, n_layers: int = 1, dropout: float = 0.0,
-                             bidirectional: bool = True, lr: float = 1e-3, epochs: int = 80,
-                             batch_size: int = 1, weight_decay: float = 1e-4, patience: int = 15,
-                             scheduler_step: int = 20, scheduler_gamma: float = 0.5,
-                             n_splits: int = 5, min_train_frac: float = 0.5,
-                             progress_cb=None):
-    n = len(series)
-    min_train = max(lookback + 6, int(n * min_train_frac))
-    step = max(1, (n - min_train) // n_splits)
-    cuts = []
-    for k in range(n_splits):
-        train_end = min_train + k * step
-        test_end  = min(train_end + step, n)
-        if test_end > train_end and train_end >= lookback + 6:
-            cuts.append((train_end, test_end))
-
-    if not cuts:
-        raise ValueError(
-            f"Serie demasiado corta para {n_splits} folds con min_train={min_train}. "
-            f"Reduce n_splits o lookback.")
-
-    folds = []
-    for fold_idx, (tr_end, te_end) in enumerate(cuts):
-        tr_series = series[:tr_end]
-        if len(tr_series) < lookback + 6:
-            folds.append(dict(fold=fold_idx + 1, error="train too short"))
-            if progress_cb:
-                progress_cb((fold_idx + 1) / len(cuts))
-            continue
-        try:
-            pred_ext, _, _, _, _ = train_bilstm(
-                series[:te_end], lookback=lookback, horizon=1,
-                hidden_dim=hidden_dim, n_layers=n_layers,
-                dropout=dropout, bidirectional=bidirectional,
-                lr=lr, epochs=epochs, batch_size=batch_size,
-                weight_decay=weight_decay, patience=patience,
-                scheduler_step=scheduler_step, scheduler_gamma=scheduler_gamma)
-            te_indices  = np.arange(tr_end, te_end)
-            y_real      = series[te_indices]
-            y_pred_raw  = pred_ext[te_indices]
-            valid       = ~np.isnan(y_pred_raw)
-            if valid.sum() < 2:
-                folds.append(dict(fold=fold_idx + 1, error="not enough valid preds"))
-                if progress_cb:
-                    progress_cb((fold_idx + 1) / len(cuts))
-                continue
-            y_real = y_real[valid]
-            y_pred = y_pred_raw[valid]
-            mae  = float(np.mean(np.abs(y_real - y_pred)))
-            rmse = float(np.sqrt(np.mean((y_real - y_pred) ** 2)))
-            mape = float(np.mean(np.abs((y_real - y_pred) / (np.abs(y_real) + 1e-8))) * 100)
-            ss_r = float(np.sum((y_real - y_pred) ** 2))
-            ss_t = float(np.sum((y_real - y_real.mean()) ** 2))
-            r2   = float(1 - ss_r / (ss_t + 1e-12))
-            folds.append(dict(fold=fold_idx + 1, train_size=tr_end,
-                               test_size=int(valid.sum()),
-                               mae=mae, rmse=rmse, mape=mape, r2=r2,
-                               y_real=y_real, y_pred=y_pred))
-        except Exception as e:
-            folds.append(dict(fold=fold_idx + 1, error=str(e)))
-        if progress_cb:
-            progress_cb((fold_idx + 1) / (len(cuts) + 1))
-
-    last_forecast = None
-    try:
-        pred_full_last, future_vals_last, metr_last, hloss_last, hval_last = train_bilstm(
-            series, lookback=lookback, horizon=horizon,
-            hidden_dim=hidden_dim, n_layers=n_layers,
-            dropout=dropout, bidirectional=bidirectional,
-            lr=lr, epochs=epochs, batch_size=batch_size,
-            weight_decay=weight_decay, patience=patience,
-            scheduler_step=scheduler_step, scheduler_gamma=scheduler_gamma)
-        last_forecast = dict(future_vals=future_vals_last, pred_full=pred_full_last,
-                             metrics=metr_last, history_loss=hloss_last, history_val=hval_last)
-    except Exception as e:
-        last_forecast = dict(error=str(e))
-
-    if progress_cb:
-        progress_cb(1.0)
-
-    valid_folds = [f for f in folds if "error" not in f]
-    if not valid_folds:
-        raise ValueError("Ningún fold completó el entrenamiento correctamente.")
-
-    agg = {
-        "MAE_mean":  float(np.mean([f["mae"]  for f in valid_folds])),
-        "MAE_std":   float(np.std( [f["mae"]  for f in valid_folds])),
-        "RMSE_mean": float(np.mean([f["rmse"] for f in valid_folds])),
-        "RMSE_std":  float(np.std( [f["rmse"] for f in valid_folds])),
-        "MAPE_mean": float(np.mean([f["mape"] for f in valid_folds])),
-        "MAPE_std":  float(np.std( [f["mape"] for f in valid_folds])),
-        "R2_mean":   float(np.mean([f["r2"]   for f in valid_folds])),
-        "R2_std":    float(np.std( [f["r2"]   for f in valid_folds])),
-        "n_folds":   len(valid_folds),
-    }
-
-    return dict(folds=folds, agg=agg, last_forecast=last_forecast)
-
-
-def build_wfv_figure(wfv_result: dict, series: np.ndarray,
-                     title: str = "") -> go.Figure:
-    valid_folds = [f for f in wfv_result["folds"] if "error" not in f]
-    n = len(series)
-    fig = make_subplots(rows=2, cols=1,
-        subplot_titles=["Predicciones por fold vs. Real", "Métricas por fold"],
-        vertical_spacing=0.15, row_heights=[0.6, 0.4])
-    fig.add_trace(go.Scatter(x=np.arange(n), y=series, mode="lines", name="Serie real",
-        line=dict(color=PINK, width=2)), row=1, col=1)
-    fold_colors = [GREEN, CYAN, YELLOW, ORANGE, "#c678dd", "#56b6c2", "#e06c75", "#ffd700"]
-    for fi, fold in enumerate(valid_folds):
-        tr_end = fold["train_size"]
-        n_test = fold["test_size"]
-        x_pred = np.arange(tr_end, tr_end + n_test)
-        fig.add_trace(go.Scatter(x=x_pred, y=fold["y_pred"],
-            mode="lines+markers", name=f"Fold {fold['fold']} pred.",
-            line=dict(color=fold_colors[fi % len(fold_colors)], width=1.6, dash="dash"),
-            marker=dict(size=4)), row=1, col=1)
-        fig.add_vrect(x0=0, x1=tr_end,
-            fillcolor=fold_colors[fi % len(fold_colors)],
-            opacity=0.04, layer="below", line_width=0, row=1, col=1)
-    fold_nums  = [f["fold"]  for f in valid_folds]
-    fold_rmses = [f["rmse"]  for f in valid_folds]
-    fold_maes  = [f["mae"]   for f in valid_folds]
-    fig.add_trace(go.Bar(x=[f"Fold {n}" for n in fold_nums], y=fold_rmses,
-        name="RMSE", marker_color=ORANGE, opacity=0.85), row=2, col=1)
-    fig.add_trace(go.Bar(x=[f"Fold {n}" for n in fold_nums], y=fold_maes,
-        name="MAE", marker_color=CYAN, opacity=0.85), row=2, col=1)
-    fig.update_layout(**PLOTLY_LAYOUT,
-        title=dict(text=f"Walk-Forward Validation — {title}",
-                   font=dict(color=CYAN, size=14)),
-        height=600, barmode="group")
-    fig.update_xaxes(title_text="Índice de muestra", row=1, col=1, gridcolor=BORDER)
-    fig.update_yaxes(title_text="Valor", row=1, col=1, gridcolor=BORDER)
-    fig.update_xaxes(title_text="Fold", row=2, col=1, gridcolor=BORDER)
-    fig.update_yaxes(title_text="Error", row=2, col=1, gridcolor=BORDER)
-    for ann in fig["layout"]["annotations"]:
-        ann["font"] = dict(color="#cdd9e5", size=11)
-    return fig
-
-
-# ════════════════════════════════════════════════════════════════════════════
-#  CARGA DE FRAMES
-# ════════════════════════════════════════════════════════════════════════════
-
-def load_frames_from_images(uploaded_files, assumed_fps: float = 1.0):
-    if len(uploaded_files) < 2:
-        raise ValueError("Se necesitan al menos 2 imágenes para calcular flujo óptico.")
-    sorted_files = sorted(uploaded_files, key=lambda f: f.name)
-    frames = []
-    failed = []
-    for i, uf in enumerate(sorted_files):
-        raw = uf.read()
-        arr = np.frombuffer(raw, dtype=np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if img is None:
-            failed.append(uf.name); continue
-        t = i / assumed_fps
-        frames.append((t, img))
-    if failed:
-        st.warning(f"No se pudieron leer {len(failed)} imagen(es): {', '.join(failed[:5])}")
-    if len(frames) < 2:
-        raise ValueError("Menos de 2 imágenes válidas cargadas.")
-    dur = frames[-1][0]
-    fps = assumed_fps
-    return frames, dur, fps
-
-
-def extract_frames_from_video(video_bytes: bytes, n_frames: int):
-    cap = None; tmp_path = None
-    for suffix in (".mp4", ".avi", ".mov", ".mkv"):
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
-            f.write(video_bytes); tmp_path = f.name
-        cap = cv2.VideoCapture(tmp_path)
-        if cap.isOpened(): break
-        cap.release(); os.unlink(tmp_path); cap = None
-    if cap is None:
-        raise RuntimeError("No se pudo abrir el video.")
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    dur   = total / fps
-    idxs  = np.linspace(0, total - 1, n_frames, dtype=int)
-    frames = []
-    for idx in idxs:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
-        ret, frm = cap.read()
-        if ret: frames.append((idx / fps, frm))
-    cap.release()
-    try: os.unlink(tmp_path)
-    except: pass
-    return frames, dur, fps
-
-
-# ════════════════════════════════════════════════════════════════════════════
-#  CARGA EXCEL
-# ════════════════════════════════════════════════════════════════════════════
-
-def parse_excel_series(uploaded_file) -> dict:
-    import pandas as pd
-    import io
-    raw = uploaded_file.read()
-    df = None
-    for engine in ["openpyxl", "xlrd"]:
-        try:
-            df = pd.read_excel(io.BytesIO(raw), engine=engine, header=0)
-            break
-        except Exception:
-            continue
-    if df is None:
-        df = pd.read_csv(io.BytesIO(raw), sep=None, engine="python", header=0)
-    if df is None or len(df) < 3:
-        raise ValueError("El archivo no tiene suficientes filas.")
-    df.columns = [str(c).strip() for c in df.columns]
-    date_col = None
-    for c in df.columns:
-        cl = c.lower()
-        if any(k in cl for k in ["fecha", "date", "time", "tiempo", "datetime"]):
-            date_col = c; break
-    if date_col is None:
-        date_col = df.columns[0]
-    disp_col = None
-    for c in df.columns:
-        cl = c.lower()
-        if any(k in cl for k in ["desplaz", "displace", "mm", "deform", "mm)"]):
-            disp_col = c; break
-    if disp_col is None:
-        for c in df.columns:
-            if c != date_col:
-                try:
-                    pd.to_numeric(df[c].astype(str).str.replace(",", "."), errors="raise")
-                    disp_col = c; break
-                except Exception:
-                    continue
-    if disp_col is None:
-        raise ValueError("No se encontró columna de desplazamiento.")
-    dates = pd.to_datetime(df[date_col], dayfirst=True, errors="coerce")
-    valid = dates.notna()
-    dates = dates[valid].reset_index(drop=True)
-    disp_raw = df[disp_col][valid].astype(str).str.replace(",", ".").str.strip()
-    displacements = pd.to_numeric(disp_raw, errors="coerce").fillna(0.0).values.astype(np.float64)
-    if len(dates) < 3:
-        raise ValueError(f"Solo {len(dates)} filas válidas tras parseo.")
-    t0 = dates.iloc[0]
-    timestamps = np.array([(d - t0).total_seconds() for d in dates], dtype=np.float64)
-    return {"name": uploaded_file.name, "timestamps": timestamps,
-            "displacements": displacements, "dates": dates,
-            "df": df[valid].reset_index(drop=True),
-            "date_col": date_col, "disp_col": disp_col}
 
 
 def build_excel_displacement_figure(series_list, processed_list, method_name, range_list):
@@ -1652,17 +1026,118 @@ def build_excel_inv_vel_figure(inv_seg_only_list):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  MAIN — optimizado (sin st.rerun innecesarios, keys únicas, caché eficiente)
+#  CARGA DE FRAMES / EXCEL
+# ════════════════════════════════════════════════════════════════════════════
+
+def load_frames_from_images(uploaded_files, assumed_fps=1.0):
+    if len(uploaded_files) < 2:
+        raise ValueError("Se necesitan al menos 2 imágenes para calcular flujo óptico.")
+    sorted_files = sorted(uploaded_files, key=lambda f: f.name)
+    frames = []
+    failed = []
+    for i, uf in enumerate(sorted_files):
+        raw = uf.read()
+        arr = np.frombuffer(raw, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            failed.append(uf.name); continue
+        frames.append((i / assumed_fps, img))
+    if failed:
+        st.warning(f"No se pudieron leer {len(failed)} imagen(es): {', '.join(failed[:5])}")
+    if len(frames) < 2:
+        raise ValueError("Menos de 2 imágenes válidas cargadas.")
+    dur = frames[-1][0]
+    return frames, dur, assumed_fps
+
+
+def extract_frames_from_video(video_bytes, n_frames):
+    cap = None; tmp_path = None
+    for suffix in (".mp4", ".avi", ".mov", ".mkv"):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
+            f.write(video_bytes); tmp_path = f.name
+        cap = cv2.VideoCapture(tmp_path)
+        if cap.isOpened(): break
+        cap.release(); os.unlink(tmp_path); cap = None
+    if cap is None:
+        raise RuntimeError("No se pudo abrir el video.")
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    dur   = total / fps
+    idxs  = np.linspace(0, total - 1, n_frames, dtype=int)
+    frames = []
+    for idx in idxs:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+        ret, frm = cap.read()
+        if ret: frames.append((idx / fps, frm))
+    cap.release()
+    try: os.unlink(tmp_path)
+    except: pass
+    return frames, dur, fps
+
+
+def parse_excel_series(uploaded_file):
+    import pandas as pd
+    import io
+    raw = uploaded_file.read()
+    df = None
+    for engine in ["openpyxl", "xlrd"]:
+        try:
+            df = pd.read_excel(io.BytesIO(raw), engine=engine, header=0)
+            break
+        except Exception:
+            continue
+    if df is None:
+        df = pd.read_csv(io.BytesIO(raw), sep=None, engine="python", header=0)
+    if df is None or len(df) < 3:
+        raise ValueError("El archivo no tiene suficientes filas.")
+    df.columns = [str(c).strip() for c in df.columns]
+    date_col = None
+    for c in df.columns:
+        cl = c.lower()
+        if any(k in cl for k in ["fecha", "date", "time", "tiempo", "datetime"]):
+            date_col = c; break
+    if date_col is None:
+        date_col = df.columns[0]
+    disp_col = None
+    for c in df.columns:
+        cl = c.lower()
+        if any(k in cl for k in ["desplaz", "displace", "mm", "deform", "mm)"]):
+            disp_col = c; break
+    if disp_col is None:
+        for c in df.columns:
+            if c != date_col:
+                try:
+                    pd.to_numeric(df[c].astype(str).str.replace(",", "."), errors="raise")
+                    disp_col = c; break
+                except Exception:
+                    continue
+    if disp_col is None:
+        raise ValueError("No se encontró columna de desplazamiento.")
+    dates = pd.to_datetime(df[date_col], dayfirst=True, errors="coerce")
+    valid = dates.notna()
+    dates = dates[valid].reset_index(drop=True)
+    disp_raw = df[disp_col][valid].astype(str).str.replace(",", ".").str.strip()
+    displacements = pd.to_numeric(disp_raw, errors="coerce").fillna(0.0).values.astype(np.float64)
+    if len(dates) < 3:
+        raise ValueError(f"Solo {len(dates)} filas válidas tras parseo.")
+    t0 = dates.iloc[0]
+    timestamps = np.array([(d - t0).total_seconds() for d in dates], dtype=np.float64)
+    return {"name": uploaded_file.name, "timestamps": timestamps,
+            "displacements": displacements, "dates": dates,
+            "df": df[valid].reset_index(drop=True),
+            "date_col": date_col, "disp_col": disp_col}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  MAIN
 # ════════════════════════════════════════════════════════════════════════════
 
 def _init_session_state():
-    """Inicializa session_state solo si las claves no existen aún."""
     defaults = dict(
         cache_key=None, frames=None, duration_sec=None, fps=None,
         timestamps=None, displacements=None, analysis_done=False,
         lstm_result=None,
         excel_series=None, excel_cache_key=None, excel_lstm_results=None,
-        excel_wfv_results={}, vid_wfv_result=None,
         excel_processing_key=None, vid_processing_key=None,
     )
     for k, v in defaults.items():
@@ -1683,8 +1158,7 @@ def main():
     with st.sidebar:
         st.header("Parámetros generales")
         n_frames    = st.slider("Número de frames (solo modo video)", 5, 200, 30, 5)
-        assumed_fps = st.slider("FPS asumido (modo imágenes)", 0.1, 60.0, 1.0, 0.1,
-                                help="Intervalo temporal entre imágenes. FPS=1 → 1 segundo.")
+        assumed_fps = st.slider("FPS asumido (modo imágenes)", 0.1, 60.0, 1.0, 0.1)
         diff_thr    = st.slider("Umbral movimiento",  2.0, 60.0, 12.0, 0.5)
         dark_thr    = st.slider("Oscuridad humo",     20, 150, 80, 2)
         tex_thr     = st.slider("Tratamiento Material en Suspensión", 0.5, 20.0, 3.5, 0.25)
@@ -1695,14 +1169,7 @@ def main():
         st.header("Algoritmo de Flujo Optico")
         flow_algo = st.selectbox("Algoritmo", [
             "RAFT-lite", "DIS", "LK-Pyramid", "Farneback"], index=0)
-        st.caption({
-            "RAFT-lite":  "Recurrent All-Pairs Field Transforms (NumPy). Volumen de correlacion 4D.",
-            "DIS":        "Dense Inverse Search (OpenCV). Muy rapido, preciso.",
-            "LK-Pyramid": "Lucas-Kanade piramidal sparse→denso via IDW.",
-            "Farneback":  "Flujo polinomial denso clasico.",
-        }[flow_algo])
 
-        st.markdown("**Parametros comunes**")
         flow_min_area = st.slider("Area minima movimiento (px)", 10, 1000, 200, 10)
 
         if flow_algo == "RAFT-lite":
@@ -1755,7 +1222,7 @@ def main():
                                max_corners=lk_max_corners, quality_level=lk_quality,
                                min_distance=lk_min_dist, block_size=lk_block_size,
                                back_threshold=lk_back_thresh, eigen_threshold=lk_eigen_thr)
-        else:  # Farneback
+        else:
             st.markdown("**Farneback**")
             pyr_scale  = st.slider("pyr_scale",  0.1, 0.9, 0.5, 0.05)
             levels     = st.slider("levels",     1, 10, 5, 1)
@@ -1770,7 +1237,6 @@ def main():
 
         st.divider()
         st.header("Procesamiento de señal")
-        st.markdown("**Método de suavizado / filtrado**")
         signal_method = st.selectbox("Método", [
             "Sin filtro (raw)", "Media móvil", "Savitzky-Golay",
             "Butterworth LP (quitar ruido)", "Solo tendencia (regresión polinómica)",
@@ -1796,7 +1262,7 @@ def main():
             signal_block_size = st.slider("Tamaño de bloque (N muestras)", 2, 200, 5, 1)
 
         st.markdown("---")
-        st.markdown("**Filtro de Outliers — Desplazamiento**")
+        st.markdown("**Filtro de Outliers**")
         out_active_sb = st.checkbox("Activar filtro de outliers", key="out_active_sb", value=False)
         out_order_sb = "Antes del suavizado"
         out_method_sb = "IQR"; out_replace_sb = "interpolate"
@@ -1814,8 +1280,8 @@ def main():
             elif out_method_sb == "Z-score":
                 out_zscore_sb = st.slider("Umbral Z-score", 1.0, 6.0, 3.0, 0.1, key="zscore_sb")
             else:
-                out_cmin_sb = st.number_input("Valor mínimo permitido", value=0.0, key="cmin_sb")
-                out_cmax_sb = st.number_input("Valor máximo permitido", value=999.0, key="cmax_sb")
+                out_cmin_sb = st.number_input("Valor mínimo", value=0.0, key="cmin_sb")
+                out_cmax_sb = st.number_input("Valor máximo", value=999.0, key="cmax_sb")
 
         st.markdown("---")
         st.markdown("**Descomposición STL**")
@@ -1833,47 +1299,24 @@ def main():
         frame_filter_placeholder = st.empty()
 
         st.divider()
-        st.header("BiLSTM — Hiperparámetros")
-        lstm_lookback = st.slider("Lookback (pasos historia)",  3, 60, 15, 1)
-        lstm_horizon  = st.slider("Horizon (pasos a predecir)", 1, 30, 5,  1)
-        lstm_arch_str = st.text_input("Arquitectura de capas (neuronas por capa)",
-            value="128, 64",
-            help="Ej: 128,64 → 2 capas. hidden_dim=máximo, n_layers=cantidad.")
-        try:
-            _arch_vals = [max(1, int(x.strip())) for x in lstm_arch_str.split(",") if x.strip()]
-            if not _arch_vals: _arch_vals = [128]
-        except ValueError:
-            _arch_vals = [128]
-            st.sidebar.warning("Formato inválido — usando 128 neuronas, 1 capa.")
-        lstm_hidden = max(_arch_vals)
-        lstm_layers = len(_arch_vals)
-        st.sidebar.caption(
-            f"→ {lstm_layers} capa{'s' if lstm_layers > 1 else ''} · "
-            f"hidden_dim={lstm_hidden} · "
-            f"neuronas: {' → '.join(str(v) for v in _arch_vals)}")
-        lstm_dropout = st.slider("Dropout",              0.0, 0.7, 0.30, 0.05)
-        lstm_bidir   = st.checkbox("Bidireccional", value=True)
-        lstm_lr      = st.select_slider("Learning rate",
-                        options=[1e-4, 3e-4, 5e-4, 1e-3, 3e-3, 5e-3, 1e-2],
-                        value=1e-3, format_func=lambda x: f"{x:.0e}")
-        lstm_epochs  = st.slider("Epochs máximos",       20, 300, 80, 10)
-        lstm_batch   = st.slider("Batch size",           8, 128, 16, 8)
-        lstm_wd      = st.select_slider("Weight decay",
-                        options=[0.0, 1e-5, 1e-4, 1e-3, 1e-2],
-                        value=1e-4, format_func=lambda x: f"{x:.0e}")
-        lstm_patience  = st.slider("Early stopping patience", 5, 50, 10, 5)
-        lstm_sch_step  = st.slider("Scheduler step (epochs)", 10, 100, 30, 5)
-        lstm_sch_gamma = st.slider("Scheduler gamma",         0.1, 0.99, 0.5, 0.05)
-
-        st.divider()
-        st.header("Modelo Híbrido")
-        use_hybrid   = st.checkbox("Usar modelo híbrido", value=True)
-        hybrid_trend = st.selectbox("Tipo de tendencia",
-                        ["auto", "exponential", "logistic", "power", "polynomial"], index=0)
-
-        st.divider()
-        st.header("Walk-Forward Validation")
-        use_wfv = st.checkbox("Activar Walk-Forward Validation", value=True)
+        st.header("FukuzonoLSTM — Hiperparámetros")
+        lstm_seq_len  = st.slider("Seq length (ventana historia)", 5, 60, 20, 1)
+        lstm_hidden   = st.select_slider("Hidden dim", options=[32, 64, 128, 256], value=128)
+        lstm_layers   = st.slider("Capas LSTM", 1, 4, 2, 1)
+        lstm_dropout  = st.slider("Dropout", 0.0, 0.6, 0.30, 0.05)
+        lstm_bidir    = st.checkbox("Bidireccional", value=True)
+        lstm_lr       = st.select_slider("Learning rate (BiLSTM)",
+                          options=[1e-4, 3e-4, 5e-4, 1e-3, 3e-3, 5e-3],
+                          value=1e-3, format_func=lambda x: f"{x:.0e}")
+        lstm_epochs   = st.slider("Epochs BiLSTM", 50, 500, 200, 25)
+        lstm_patience = st.slider("Early stopping patience", 10, 80, 30, 5)
+        reg_epochs    = st.slider("Epochs cabeza de regresión", 50, 500, 200, 25)
+        reg_lr        = st.select_slider("Learning rate (cabeza)",
+                          options=[1e-4, 3e-4, 5e-4, 1e-3, 3e-3],
+                          value=1e-3, format_func=lambda x: f"{x:.0e}")
+        lstm_step_h   = st.slider("Paso autorregresivo (horas)", 1, 168, 24, 1)
+        lstm_max_steps= st.slider("Pasos máximos autorregresivos", 10, 300, 120, 10)
+        lstm_stop_thr = st.slider("Umbral de parada 1/v (falla)", 0.01, 10.0, 0.5, 0.01)
 
     st.markdown("---")
     input_mode = st.radio("Fuente de entrada",
@@ -1914,7 +1357,6 @@ def main():
             f"{out_zscore_sb if out_active_sb else ''}"
         )
 
-        # Cargar archivos solo si cambiaron
         if st.session_state["excel_cache_key"] != excel_cache_key:
             series_list = []
             errors = []
@@ -1938,7 +1380,6 @@ def main():
         if not series_list:
             st.error("No hay series cargadas."); return
 
-        # Invalidar LSTM si cambiaron parámetros de procesamiento (sin rerun)
         if st.session_state.get("excel_processing_key") != processing_key:
             st.session_state["excel_lstm_results"] = None
             st.session_state["excel_processing_key"] = processing_key
@@ -1986,7 +1427,6 @@ def main():
             raw_seg  = raw_full[fa_e:fb_e]
             lbl_e    = s["name"].replace(".xlsx","").replace(".xls","")
 
-            # Outlier antes
             if out_active_sb and out_order_sb == "Antes del suavizado":
                 seg_step1 = apply_outlier_filter(raw_seg, method=out_method_sb,
                     iqr_k=out_iqr_k_sb, zscore_thr=out_zscore_sb,
@@ -1994,12 +1434,10 @@ def main():
             else:
                 seg_step1 = raw_seg.copy()
 
-            # Suavizado
             seg_step2 = apply_signal_processing(seg_step1, method=signal_method,
                 window=signal_window, polyorder=signal_polyord, cutoff=signal_cutoff,
                 fourier_terms=signal_fourier_terms, block_size=signal_block_size)
 
-            # Outlier después
             if out_active_sb and out_order_sb == "Después del suavizado":
                 seg_final_disp = apply_outlier_filter(seg_step2, method=out_method_sb,
                     iqr_k=out_iqr_k_sb, zscore_thr=out_zscore_sb,
@@ -2016,8 +1454,7 @@ def main():
                 fig_t.update_layout(**PLOTLY_LAYOUT,
                     title=dict(text=f"Desplazamiento procesado — {lbl_e}", font=dict(color=CYAN)),
                     xaxis_title="t (s)", yaxis_title="mm", height=240)
-                st.plotly_chart(fig_t, use_container_width=True,
-                                key=f"excel_sig_proc_{idx}")
+                st.plotly_chart(fig_t, use_container_width=True, key=f"excel_sig_proc_{idx}")
 
                 if stl_show_disp:
                     decomp_d = stl_decompose(seg_final_disp, ts_seg, period=stl_period)
@@ -2057,7 +1494,7 @@ def main():
                                                     signal_method, range_list)
         st.plotly_chart(fig_disp, use_container_width=True, key="excel_disp_all")
 
-        st.subheader("Velocidad Inversa — todas las series (señal final)")
+        st.subheader("Velocidad Inversa — todas las series")
         fig_inv = build_excel_inv_vel_figure(inv_seg_only_list)
         st.plotly_chart(fig_inv, use_container_width=True, key="excel_inv_all")
 
@@ -2076,214 +1513,111 @@ def main():
             })
         st.dataframe(pd.DataFrame(stats_rows), use_container_width=True, hide_index=True)
 
+        # ── FukuzonoLSTM para Excel ──────────────────────────────────────────
         st.divider()
-        st.subheader("Predicción BiLSTM — Series Temporales Excel")
+        st.subheader("Predicción FukuzonoLSTM — Series Temporales Excel")
 
-        st.markdown("##### Datos que entrarán al modelo BiLSTM")
-        fig_lstm_input = go.Figure()
-        COLORS_PREV = [PINK, "#c678dd", GREEN, ORANGE, CYAN, "#e5c07b"]
-        for idx_p, (ts_iv_i, inv_proc_i, inv_raw_i, _, _, _, lbl_i) in enumerate(inv_seg_only_list):
-            c_p = COLORS_PREV[idx_p % len(COLORS_PREV)]
-            _cap = float(np.percentile(inv_proc_i[inv_proc_i > 0], 99)) if (inv_proc_i > 0).any() else 1.0
-            ir_disp = np.where(inv_raw_i > _cap * 3, np.nan, inv_raw_i)
-            fig_lstm_input.add_trace(go.Scatter(x=ts_iv_i, y=ir_disp, mode="lines",
-                name=f"{lbl_i} raw", line=dict(color=c_p, width=1, dash="dot"), opacity=0.4))
-            fig_lstm_input.add_trace(go.Scatter(x=ts_iv_i, y=inv_proc_i, mode="lines",
-                name=f"{lbl_i} procesada (→ BiLSTM)",
-                line=dict(color=c_p, width=2.5),
-                fill="tozeroy", fillcolor="rgba(255,107,157,0.06)"))
-        fig_lstm_input.update_layout(**PLOTLY_LAYOUT,
-            title=dict(text="Velocidad Inversa — entrada exacta al BiLSTM",
-                       font=dict(color=CYAN, size=13)),
-            xaxis_title="Tiempo (s)", yaxis_title="1/|Δdesplazamiento|", height=300)
-        st.plotly_chart(fig_lstm_input, use_container_width=True, key="excel_lstm_input")
-
-        for idx_t, (ts_iv_i, inv_proc_i, inv_raw_i, disp_proc_i, disp_raw_i, ts_full_i, lbl_i) in enumerate(inv_seg_only_list):
-            with st.expander(f"📋 Tabla de trazabilidad — {lbl_i}"):
-                _n_t = min(len(ts_iv_i), len(inv_raw_i), len(inv_proc_i))
-                _df_t = pd.DataFrame({
-                    "t (s)":               np.round(ts_iv_i[:_n_t], 4),
-                    "Disp. Raw (mm)":      np.round(disp_raw_i[1:_n_t+1], 6),
-                    "Disp. Procesado (mm)":np.round(disp_proc_i[1:_n_t+1], 6),
-                    "1/v Raw":             np.round(inv_raw_i[:_n_t], 6),
-                    "1/v Procesada":       np.round(inv_proc_i[:_n_t], 6)})
-                st.dataframe(_df_t, use_container_width=True, hide_index=True)
-
-        # WFV config
-        wfv_n_splits = 3; wfv_min_frac = 0.5; wfv_epochs = 40; wfv_patience = 8
-        if use_wfv:
-            with st.expander("⚙️ Parámetros Walk-Forward Validation", expanded=False):
-                wfv_col1, wfv_col2 = st.columns(2)
-                with wfv_col1:
-                    wfv_n_splits = st.slider("Número de folds WFV", 2, 10, 5, 1, key="wfv_n_splits")
-                    wfv_min_frac = st.slider("Fracción mínima de entrenamiento",
-                                              0.3, 0.8, 0.5, 0.05, key="wfv_min_frac")
-                with wfv_col2:
-                    wfv_epochs   = st.slider("Epochs por fold WFV", 20, 200, 60, 10, key="wfv_epochs")
-                    wfv_patience = st.slider("Patience por fold WFV", 5, 30, 10, 1, key="wfv_patience")
-
-        lstm_excel_btn = st.button("Entrenar BiLSTM en todas las series",
+        lstm_excel_btn = st.button("Entrenar FukuzonoLSTM en todas las series",
                                     type="primary", key="lstm_excel_btn")
 
         if lstm_excel_btn:
             results = {}
-            for idx, (ts_iv_i, inv_proc_i, inv_raw_i, _, _, _, lbl_raw) in enumerate(inv_seg_only_list):
-                serie_lstm = inv_proc_i
-                n_min = lstm_lookback + 6
+            for idx, (ts_iv_i, inv_proc_i, inv_raw_i, disp_proc_i, disp_raw_i,
+                       ts_full_i, lbl_raw) in enumerate(inv_seg_only_list):
+
                 lbl = series_list[idx]["name"]
-                if len(serie_lstm) < n_min:
-                    st.warning(f"{lbl}: serie demasiado corta ({len(serie_lstm)} pts). Saltando.")
+                n_min = lstm_seq_len + 4
+                if len(inv_proc_i) < n_min:
+                    st.warning(f"{lbl}: serie demasiado corta ({len(inv_proc_i)} pts). Saltando.")
                     continue
+
                 st.markdown(f"##### Entrenando: `{lbl}`")
                 prog = st.progress(0, text=f"{lbl} — entrenando...")
-                trend_info_saved = None
+
+                # Construir vel a partir de inv_v (1/inv_v)
+                vel_i  = 1.0 / (inv_proc_i + 1e-8)
+                disp_i = disp_proc_i[1:]  # alinear con inv_v (len-1)
+                t_days_i = ts_iv_i / 86400.0  # convertir segundos a días
+
+                # Alinear todo al mismo tamaño
+                _n = min(len(inv_proc_i), len(disp_i), len(t_days_i))
+                inv_i_ = inv_proc_i[:_n]
+                disp_i_ = disp_i[:_n]
+                vel_i_  = vel_i[:_n]
+                t_i_    = t_days_i[:_n]
+
                 try:
-                    if use_hybrid:
-                        pred_tr, fut, metr, hloss, hval, trend_info_saved = train_hybrid(
-                            serie_lstm, lookback=lstm_lookback, horizon=lstm_horizon,
-                            hidden_dim=lstm_hidden, n_layers=lstm_layers,
-                            dropout=lstm_dropout, bidirectional=lstm_bidir,
-                            lr=lstm_lr, epochs=lstm_epochs, batch_size=lstm_batch,
-                            weight_decay=lstm_wd, patience=lstm_patience,
-                            scheduler_step=lstm_sch_step, scheduler_gamma=lstm_sch_gamma,
-                            trend_type=hybrid_trend)
-                    else:
-                        pred_tr, fut, metr, hloss, hval = train_bilstm(
-                            serie_lstm, lookback=lstm_lookback, horizon=lstm_horizon,
-                            hidden_dim=lstm_hidden, n_layers=lstm_layers,
-                            dropout=lstm_dropout, bidirectional=lstm_bidir,
-                            lr=lstm_lr, epochs=lstm_epochs, batch_size=lstm_batch,
-                            weight_decay=lstm_wd, patience=lstm_patience,
-                            scheduler_step=lstm_sch_step, scheduler_gamma=lstm_sch_gamma)
-                    prog.progress(0.4, text=f"{lbl} — modelo OK, iniciando WFV...")
+                    pred_tr, fut_inv, fut_t_off, metr, hloss = train_fukuzono(
+                        inv_i_, disp_i_, vel_i_, t_i_,
+                        seq_len=lstm_seq_len,
+                        hidden_dim=lstm_hidden, n_layers=lstm_layers,
+                        dropout=lstm_dropout, bidirectional=lstm_bidir,
+                        lr=lstm_lr, epochs=lstm_epochs, patience=lstm_patience,
+                        reg_epochs=reg_epochs, reg_lr=reg_lr,
+                        step_hours=lstm_step_h, max_steps=lstm_max_steps,
+                        stop_threshold=lstm_stop_thr,
+                        progress_cb=lambda f, _p=prog, _l=lbl: _p.progress(f, text=f"{_l} — {f*100:.0f}%"))
+                    prog.progress(1.0, text=f"{lbl} — completado ✓")
+                    results[lbl] = (pred_tr, fut_inv, fut_t_off, metr, hloss, ts_iv_i[:_n], inv_i_)
                 except Exception as e:
                     prog.empty()
                     st.error(f"Error entrenando {lbl}: {e}")
-                    continue
-
-                wfv_res = None
-                if use_wfv and len(serie_lstm) >= n_min * 2:
-                    try:
-                        def _wfv_cb(frac, _p=prog, _l=lbl, _n=wfv_n_splits):
-                            _p.progress(0.4 + frac * 0.6,
-                                        text=f"{_l} — WFV fold {int(frac*_n)}/{_n}")
-                        wfv_res = walk_forward_validation(
-                            serie_lstm, lookback=lstm_lookback, horizon=lstm_horizon,
-                            hidden_dim=lstm_hidden, n_layers=lstm_layers,
-                            dropout=lstm_dropout, bidirectional=lstm_bidir,
-                            lr=lstm_lr, epochs=wfv_epochs, batch_size=lstm_batch,
-                            weight_decay=lstm_wd, patience=wfv_patience,
-                            scheduler_step=lstm_sch_step, scheduler_gamma=lstm_sch_gamma,
-                            n_splits=wfv_n_splits, min_train_frac=wfv_min_frac,
-                            progress_cb=_wfv_cb)
-                    except Exception as e:
-                        st.warning(f"WFV no pudo completarse para {lbl}: {e}")
-
-                prog.progress(1.0, text=f"{lbl} — completado ✓")
-                results[lbl] = (pred_tr, fut, metr, hloss, hval,
-                                ts_iv_i, serie_lstm, wfv_res, trend_info_saved)
 
             st.session_state["excel_lstm_results"] = results if results else None
 
-        # Mostrar resultados
         xlr = st.session_state["excel_lstm_results"]
         if xlr:
-            for lbl_res_idx, (lbl, entry) in enumerate(xlr.items()):
-                if len(entry) == 9:
-                    pred_tr, fut, metr, hloss, hval, ts_s, iv_s, wfv_res, trend_info_s = entry
-                else:
-                    pred_tr, fut, metr, hloss, hval = entry[0], entry[1], entry[2], entry[3], entry[4]
-                    ts_s, iv_s = entry[5], entry[6]
-                    wfv_res = entry[7] if len(entry) > 7 else None
-                    trend_info_s = entry[8] if len(entry) > 8 else None
-
+            for res_idx, (lbl, entry) in enumerate(xlr.items()):
+                pred_tr, fut_inv, fut_t_off, metr, hloss, ts_s, iv_s = entry
                 st.markdown(f"#### {lbl}")
-                lf = wfv_res.get("last_forecast") if wfv_res else None
-                lf_ok = lf and "error" not in lf
-                fut_show     = lf["future_vals"]   if lf_ok else fut
-                pred_show    = lf["pred_full"]     if lf_ok else pred_tr
-                metr_show    = lf["metrics"]       if lf_ok else metr
-                hloss_show   = lf["history_loss"]  if lf_ok else hloss
-                hval_show    = lf.get("history_val") if lf_ok else hval
 
-                # Key única por serie y por resultado
-                _fig_key = f"excel_main_{lbl_res_idx}_{lbl[:20]}"
+                # Convertir offsets de días a segundos para el eje X
+                fut_t_sec = ts_s[-1] + fut_t_off * 86400.0
 
-                if trend_info_s is not None:
-                    fig_main = build_hybrid_figure(ts_s, iv_s, pred_show, fut_show,
-                        trend_info_s, metr_show, hloss_show, lstm_horizon,
-                        history_val=hval_show)
-                    all_r2 = trend_info_s.get("all_r2", {})
-                    r2_str = "  |  ".join(f"**{k}** R²={v:.3f}" for k, v in
-                                          sorted(all_r2.items(), key=lambda x: -x[1]))
-                    st.caption(f"Tendencias evaluadas → {r2_str}")
-                else:
-                    fig_main = build_lstm_figure(ts_s, iv_s, pred_show, fut_show,
-                        metr_show, hloss_show, lstm_horizon, history_val=hval_show)
+                fig_main = build_fukuzono_figure(
+                    ts_s, iv_s, pred_tr,
+                    fut_t_sec - ts_s[-1],   # offsets en segundos
+                    fut_inv, metr, hloss, lstm_stop_thr)
+                # Ajustar x para que sea absoluto
+                fig_main = build_fukuzono_figure(
+                    ts_s, iv_s, pred_tr,
+                    fut_t_off * 86400.0, fut_inv, metr, hloss, lstm_stop_thr)
 
-                st.plotly_chart(fig_main, use_container_width=True, key=_fig_key)
-
-                if lf_ok:
-                    st.info("**Pronóstico activo: WFV (modelo calibrado con toda la serie)**")
+                st.plotly_chart(fig_main, use_container_width=True,
+                                key=f"excel_fuku_{res_idx}_{lbl[:20]}")
 
                 mc1, mc2, mc3, mc4 = st.columns(4)
-                mc1.metric("MAE",  f"{metr_show['MAE']:.5f}")
-                mc2.metric("RMSE", f"{metr_show['RMSE']:.5f}")
-                mc3.metric("MAPE", f"{metr_show['MAPE']:.2f}%")
-                mc4.metric("R²",   f"{metr_show['R2']:.4f}")
+                mc1.metric("MAE",  f"{metr['MAE']:.5f}")
+                mc2.metric("RMSE", f"{metr['RMSE']:.5f}")
+                mc3.metric("MAPE", f"{metr['MAPE']:.2f}%")
+                mc4.metric("R²",   f"{metr['R2']:.4f}")
 
-                if trend_info_s is not None:
-                    st.caption(f"Tendencia: **{trend_info_s['trend_type']}** "
-                               f"(R²={trend_info_s['r2']:.4f}) · BiLSTM sobre residuo")
+                if len(fut_inv) > 0:
+                    t_falla_s = ts_s[-1] + fut_t_off[-1] * 86400.0
+                    st.info(
+                        f"**Falla proyectada:** offset {fut_t_off[-1]:.1f} días desde el último dato  |  "
+                        f"Pasos autorregresivos: {len(fut_inv)}  |  "
+                        f"1/v final: {fut_inv[-1]:.4f}")
 
-                if lf_ok:
-                    with st.expander("Métricas modelo inicial (referencia)"):
-                        rm1, rm2, rm3, rm4 = st.columns(4)
-                        rm1.metric("MAE",  f"{metr['MAE']:.5f}")
-                        rm2.metric("RMSE", f"{metr['RMSE']:.5f}")
-                        rm3.metric("MAPE", f"{metr['MAPE']:.2f}%")
-                        rm4.metric("R²",   f"{metr['R2']:.4f}")
-
-                if wfv_res:
-                    agg = wfv_res["agg"]
-                    st.markdown("**Validación Cruzada Walk-Forward**")
-                    st.caption(f"{agg['n_folds']} folds completados")
-                    wc1, wc2, wc3, wc4 = st.columns(4)
-                    wc1.metric("MAE WFV",  f"{agg['MAE_mean']:.5f}", delta=f"±{agg['MAE_std']:.5f}")
-                    wc2.metric("RMSE WFV", f"{agg['RMSE_mean']:.5f}", delta=f"±{agg['RMSE_std']:.5f}")
-                    wc3.metric("MAPE WFV", f"{agg['MAPE_mean']:.2f}%", delta=f"±{agg['MAPE_std']:.2f}%")
-                    wc4.metric("R² WFV",   f"{agg['R2_mean']:.4f}", delta=f"±{agg['R2_std']:.4f}")
-                    fig_wfv = build_wfv_figure(wfv_res, iv_s, title=lbl)
-                    st.plotly_chart(fig_wfv, use_container_width=True,
-                                    key=f"excel_wfv_{lbl_res_idx}_{lbl[:20]}")
-                    with st.expander(f"Tabla detallada por fold — {lbl}"):
-                        fold_rows = []
-                        for f in wfv_res["folds"]:
-                            if "error" in f:
-                                fold_rows.append({"Fold": f["fold"],
-                                    "Estado": f"Error: {f['error']}",
-                                    "MAE":"—","RMSE":"—","MAPE":"—","R²":"—",
-                                    "Train pts":"—","Test pts":"—"})
-                            else:
-                                fold_rows.append({"Fold": f["fold"], "Estado": "✓",
-                                    "MAE": f"{f['mae']:.5f}", "RMSE": f"{f['rmse']:.5f}",
-                                    "MAPE": f"{f['mape']:.2f}%", "R²": f"{f['r2']:.4f}",
-                                    "Train pts": f["train_size"], "Test pts": f["test_size"]})
-                        st.dataframe(pd.DataFrame(fold_rows),
-                                     use_container_width=True, hide_index=True)
-                else:
-                    st.caption("Serie demasiado corta para Walk-Forward Validation.")
-
-                with st.expander(f"Pronóstico detallado — {lbl}"):
-                    dt_ = float(np.mean(np.diff(ts_s))) if len(ts_s) > 1 else 1.0
-                    t_fut_ = ts_s[-1] + np.arange(1, lstm_horizon + 1) * dt_
-                    fut_table = fut_show if lf_ok else fut
-                    st.dataframe(pd.DataFrame({
-                        "Paso": list(range(1, lstm_horizon + 1)),
-                        "t (s)": [f"{t:.1f}" for t in t_fut_],
-                        "1/|Δdisp| pred.": [f"{v:.6f}" for v in fut_table],
-                        "|Δdisp| estimado (mm)": [f"{1/(v+1e-9):.8f}" for v in fut_table]}),
-                        use_container_width=True)
+                with st.expander(f"Detalle modelo y pronóstico — {lbl}"):
+                    st.markdown(f"""
+| Parámetro | Valor |
+|-----------|-------|
+| Seq length | {metr['seq_len']} |
+| Hidden dim | {metr['hidden_dim']} |
+| Capas LSTM | {metr['n_layers']} |
+| Bidireccional | {metr['bidirectional']} |
+| Parámetros totales | {metr['n_params']:,} |
+| Epochs ejecutados | {metr['epochs_run']} |
+| Mejor val loss | {metr['best_val_loss']:.6f} |
+""")
+                    _dt = pd.DataFrame({
+                        "Paso": list(range(1, len(fut_inv) + 1)),
+                        "Offset (días)": np.round(fut_t_off, 2),
+                        "1/v proyectado": np.round(fut_inv, 4),
+                        "v estimada (1/día)": np.round(1.0 / (fut_inv + 1e-8), 6),
+                    })
+                    st.dataframe(_dt, use_container_width=True, hide_index=True)
         return
 
     # ════════════════════════════════════════════════════════════════════════
@@ -2369,23 +1703,17 @@ def main():
 
     with col_sliders:
         st.markdown("**Posición y tamaño del ROI**")
-        roi_x = st.slider("Origen X (columna izquierda)",
-            min_value=0, max_value=_W - 2,
+        roi_x = st.slider("Origen X", min_value=0, max_value=_W - 2,
             value=st.session_state[roi_key][0], step=1, key="roi_x")
-        roi_y = st.slider("Origen Y (fila superior)",
-            min_value=0, max_value=_H - 2,
+        roi_y = st.slider("Origen Y", min_value=0, max_value=_H - 2,
             value=st.session_state[roi_key][1], step=1, key="roi_y")
-        roi_w = st.slider("Ancho del ROI",
-            min_value=2, max_value=_W - roi_x,
+        roi_w = st.slider("Ancho del ROI", min_value=2, max_value=_W - roi_x,
             value=min(st.session_state[roi_key][2], _W - roi_x), step=1, key="roi_w")
-        roi_h = st.slider("Alto del ROI",
-            min_value=2, max_value=_H - roi_y,
+        roi_h = st.slider("Alto del ROI", min_value=2, max_value=_H - roi_y,
             value=min(st.session_state[roi_key][3], _H - roi_y), step=1, key="roi_h")
 
-        # ── IMPORTANTE: resetear ROI usando session_state en lugar de st.rerun ──
         if st.button("Resetear ROI (imagen completa)"):
             st.session_state[roi_key] = (0, 0, _W, _H)
-            # Actualizamos directamente los sliders via session_state (sin rerun)
             st.session_state["roi_x"] = 0
             st.session_state["roi_y"] = 0
             st.session_state["roi_w"] = _W
@@ -2401,7 +1729,6 @@ def main():
 | Ancho | {roi_w} px |
 | Alto | {roi_h} px |
 | Área ROI | {roi_w * roi_h:,} px² |
-| Área total | {_W * _H:,} px² |
 | Cobertura | {roi_w * roi_h / (_W * _H) * 100:.1f}% |
 """)
 
@@ -2472,7 +1799,7 @@ def main():
                 with st.expander(
                     f"Par {i+1}/{total_pairs}  t={t1:.2f}s → {t2:.2f}s  disp={disp:.2f}px",
                     expanded=(i == 0)):
-                    BG_ = "#0d1117"; BG2_ = "#161b22"; TEXT_ = "#e6edf3"
+                    BG_ = "#0d1117"; TEXT_ = "#e6edf3"
                     fig_p, axes_p = plt.subplots(2, 3, figsize=(18, 10), facecolor=BG_)
                     axes_p = axes_p.flatten()
                     def rgb(bgr): return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -2541,7 +1868,6 @@ def main():
     ts_arr = np.array(timestamps)
     ds_arr = np.array(displacements)
 
-    # Invalidar LSTM si cambiaron parámetros (sin rerun)
     _vid_proc_key = (
         f"{st.session_state['cache_key']}|{signal_method}|{signal_window}|"
         f"{signal_polyord}|{signal_cutoff}|{signal_fourier_terms}|{signal_block_size}|"
@@ -2555,7 +1881,6 @@ def main():
         st.session_state["lstm_result"] = None
         st.session_state["vid_processing_key"] = _vid_proc_key
 
-    # Procesamiento de señal sobre rango
     fa, fb = frame_range
     fb = min(fb + 1, len(ds_arr))
     fa = min(fa, fb - 1)
@@ -2568,25 +1893,6 @@ def main():
             fourier_terms=signal_fourier_terms, block_size=signal_block_size)
         processed_full[fa:fb] = seg_proc
 
-    _a_seg   = ds_arr[fa:fb]
-    _b_seg   = processed_full[fa:fb]
-    _ts_seg_full = ts_arr[fa:fb]
-
-    _ts_iv_raw,  _iv_raw  = compute_inv_vel(_a_seg, _ts_seg_full)
-    _ts_iv_proc, _iv_proc = compute_inv_vel(_b_seg, _ts_seg_full)
-
-    st.divider()
-    st.subheader("Velocidad óptica y velocidad inversa")
-    st.caption(f"Filtro activo: **{signal_method}**  |  Rango pares: {fa} → {fb-1}")
-
-    fig_vel = build_velocity_figure(ts_arr, ds_arr, processed_full,
-                                     (fa, fb), signal_method)
-    st.plotly_chart(fig_vel, use_container_width=True, key="vid_fig_vel")
-
-    fig_inv_init = build_inverse_velocity_figure(_ts_iv_raw, _iv_raw, _iv_proc)
-    st.plotly_chart(fig_inv_init, use_container_width=True, key="vid_fig_inv_init")
-
-    # Outliers sobre segmento
     ts_seg       = ts_arr[fa:fb]
     seg_for_lstm = processed_full[fa:fb].copy()
 
@@ -2604,28 +1910,18 @@ def main():
                 iqr_k=out_iqr_k_sb, zscore_thr=out_zscore_sb,
                 clip_min=out_cmin_sb, clip_max=out_cmax_sb, replace=out_replace_sb)
 
-        diff_out_mask = np.abs(seg_for_lstm - processed_full[fa:fb]) > 1e-12
-        if diff_out_mask.any():
-            st.divider()
-            st.subheader("Desplazamiento — outliers removidos")
-            fig_out_vid = go.Figure()
-            fig_out_vid.add_trace(go.Scatter(x=ts_seg, y=ds_arr[fa:fb], name="Raw",
-                line=dict(color=CYAN, width=1, dash="dot"), opacity=0.4))
-            fig_out_vid.add_trace(go.Scatter(x=ts_seg, y=processed_full[fa:fb],
-                name="Suavizado", line=dict(color=ORANGE, width=1.5, dash="dash")))
-            fig_out_vid.add_trace(go.Scatter(x=ts_seg, y=seg_for_lstm,
-                name="Sin outliers (→ LSTM)", line=dict(color=GREEN, width=2.2)))
-            fig_out_vid.add_trace(go.Scatter(x=ts_seg[diff_out_mask],
-                y=ds_arr[fa:fb][diff_out_mask], mode="markers",
-                name="Outliers detectados", marker=dict(color=PINK, size=7, symbol="x")))
-            fig_out_vid.update_layout(**PLOTLY_LAYOUT,
-                title=dict(text="Desplazamiento — outliers detectados y removidos",
-                           font=dict(color=CYAN)),
-                xaxis_title="Tiempo (s)", yaxis_title="px/frame", height=300)
-            st.plotly_chart(fig_out_vid, use_container_width=True, key="vid_fig_out")
+    _ts_iv_raw, _iv_raw   = compute_inv_vel(ds_arr[fa:fb], ts_seg)
+    ts_iv_lstm, inv_lstm  = compute_inv_vel(seg_for_lstm, ts_seg)
 
-    ts_seg = ts_arr[fa:fb]
-    ts_iv_lstm, inv_lstm_seg = compute_inv_vel(seg_for_lstm, ts_seg)
+    st.divider()
+    st.subheader("Velocidad óptica y velocidad inversa")
+    st.caption(f"Filtro activo: **{signal_method}**  |  Rango pares: {fa} → {fb-1}")
+
+    fig_vel = build_velocity_figure(ts_arr, ds_arr, processed_full, (fa, fb), signal_method)
+    st.plotly_chart(fig_vel, use_container_width=True, key="vid_fig_vel")
+
+    fig_inv_init = build_inverse_velocity_figure(_ts_iv_raw, _iv_raw, inv_lstm)
+    st.plotly_chart(fig_inv_init, use_container_width=True, key="vid_fig_inv_init")
 
     # STL
     if stl_show_disp or stl_show_inv:
@@ -2644,7 +1940,7 @@ def main():
             st.warning("Serie demasiado corta para STL (desplazamiento).")
 
     if stl_show_inv:
-        decomp_inv_stl = stl_decompose(inv_lstm_seg, ts_iv_lstm, period=stl_period)
+        decomp_inv_stl = stl_decompose(inv_lstm, ts_iv_lstm, period=stl_period)
         if decomp_inv_stl:
             fig_stl_i = build_decomposition_figure(decomp_inv_stl, "Velocidad Inversa (1/v)",
                                                     "1/v", ts_iv_lstm)
@@ -2669,216 +1965,124 @@ def main():
                   delta=f"t={timestamps[im]:.1f}s")
         c6.metric("Desp. medio",  f"{np.mean(displacements):.2f} px")
 
-    # BiLSTM
+    # ── FukuzonoLSTM para Video/Imágenes ─────────────────────────────────────
     st.divider()
-    st.subheader("Predicción BiLSTM — Velocidad Inversa")
-    st.markdown("##### Datos que entrarán al modelo BiLSTM")
+    st.subheader("Predicción FukuzonoLSTM — Velocidad Inversa")
 
-    _ts_iv_raw_prev, _iv_raw_prev = compute_inv_vel(ds_arr[fa:fb], ts_seg)
     fig_lstm_in = go.Figure()
-    fig_lstm_in.add_trace(go.Scatter(x=_ts_iv_raw_prev, y=_iv_raw_prev, mode="lines",
-        name="1/v Raw (sin procesar)", line=dict(color="#888", width=1, dash="dot"), opacity=0.5))
-    fig_lstm_in.add_trace(go.Scatter(x=ts_iv_lstm, y=inv_lstm_seg, mode="lines",
-        name="1/v Procesada (→ entra al BiLSTM)",
+    fig_lstm_in.add_trace(go.Scatter(x=_ts_iv_raw, y=_iv_raw, mode="lines",
+        name="1/v Raw", line=dict(color="#888", width=1, dash="dot"), opacity=0.5))
+    fig_lstm_in.add_trace(go.Scatter(x=ts_iv_lstm, y=inv_lstm, mode="lines",
+        name="1/v Procesada (→ entra al LSTM)",
         line=dict(color=PINK, width=2.5),
         fill="tozeroy", fillcolor="rgba(255,107,157,0.07)"))
     fig_lstm_in.update_layout(**PLOTLY_LAYOUT,
-        title=dict(text="Velocidad Inversa — entrada exacta al BiLSTM",
+        title=dict(text="Velocidad Inversa — entrada exacta al FukuzonoLSTM",
                    font=dict(color=CYAN, size=13)),
-        xaxis_title="Tiempo (s)", yaxis_title="1/(px/frame)", height=300)
+        xaxis_title="Tiempo (s)", yaxis_title="1/(px/frame)", height=280)
     st.plotly_chart(fig_lstm_in, use_container_width=True, key="vid_lstm_input")
 
     with st.expander("📋 Tabla de trazabilidad"):
         import pandas as pd
-        _n_tr = min(len(_ts_iv_raw_prev), len(_iv_raw_prev), len(inv_lstm_seg))
+        _n_tr = min(len(_ts_iv_raw), len(_iv_raw), len(inv_lstm))
         _df_traz = pd.DataFrame({
-            "t (s)":            np.round(_ts_iv_raw_prev[:_n_tr], 4),
+            "t (s)":            np.round(_ts_iv_raw[:_n_tr], 4),
             "Desp. Raw (px)":   np.round(ds_arr[fa:fb][1:_n_tr+1], 6),
             "Desp. Proc. (px)": np.round(seg_for_lstm[1:_n_tr+1], 6),
-            "1/v Raw":          np.round(_iv_raw_prev[:_n_tr], 6),
-            "1/v Procesada":    np.round(inv_lstm_seg[:_n_tr], 6)})
+            "1/v Raw":          np.round(_iv_raw[:_n_tr], 6),
+            "1/v Procesada":    np.round(inv_lstm[:_n_tr], 6)})
         st.dataframe(_df_traz, use_container_width=True, hide_index=True)
 
-    inv_series_for_lstm = inv_lstm_seg
-
-    # WFV config
-    _wfv_splits = 3; _wfv_minfrac = 0.5; _wfv_ep = 40; _wfv_pat = 8
-    if use_wfv:
-        with st.expander("⚙️ Parámetros Walk-Forward Validation", expanded=False):
-            _wfv_c1, _wfv_c2 = st.columns(2)
-            with _wfv_c1:
-                _wfv_splits  = st.slider("Número de folds WFV", 2, 8, 4, 1, key="vid_wfv_splits")
-                _wfv_minfrac = st.slider("Fracción mín. entrenamiento",
-                                          0.3, 0.8, 0.5, 0.05, key="vid_wfv_minfrac")
-            with _wfv_c2:
-                _wfv_ep   = st.slider("Epochs por fold WFV", 20, 150, 50, 10, key="vid_wfv_ep")
-                _wfv_pat  = st.slider("Patience por fold WFV", 5, 25, 10, 1, key="vid_wfv_pat")
-
     st.divider()
-    lstm_btn = st.button("Entrenar BiLSTM y pronosticar", type="primary")
+    lstm_btn = st.button("Entrenar FukuzonoLSTM y proyectar", type="primary")
 
     if lstm_btn:
-        n_min = lstm_lookback + 6
-        if len(inv_series_for_lstm) < n_min:
+        n_min = lstm_seq_len + 4
+        if len(inv_lstm) < n_min:
             st.error(
-                f"Serie demasiado corta ({len(inv_series_for_lstm)} puntos). "
+                f"Serie demasiado corta ({len(inv_lstm)} puntos). "
                 f"Necesitas al menos {n_min} puntos.")
         else:
-            prog_bar = st.progress(0, text="Entrenando...")
-            wfv_res_vid = None; trend_info_vid = None
+            prog_bar = st.progress(0, text="Entrenando FukuzonoLSTM...")
+
+            # Construir vel, disp y t_days desde la serie de velocidad inversa
+            vel_vid   = 1.0 / (inv_lstm + 1e-8)
+            disp_vid  = seg_for_lstm[1:]   # alinear con inv_lstm (len-1)
+            t_days_vid = ts_iv_lstm / 86400.0
+
+            _n = min(len(inv_lstm), len(disp_vid), len(t_days_vid))
+            inv_v_ = inv_lstm[:_n]
+            disp_  = disp_vid[:_n]
+            vel_   = vel_vid[:_n]
+            t_d_   = t_days_vid[:_n]
+
             try:
-                if use_hybrid:
-                    pred_tr, fut, metr, hloss, hval, trend_info_vid = train_hybrid(
-                        inv_series_for_lstm, lookback=lstm_lookback, horizon=lstm_horizon,
-                        hidden_dim=lstm_hidden, n_layers=lstm_layers, dropout=lstm_dropout,
-                        bidirectional=lstm_bidir, lr=lstm_lr, epochs=lstm_epochs,
-                        batch_size=lstm_batch, weight_decay=lstm_wd, patience=lstm_patience,
-                        scheduler_step=lstm_sch_step, scheduler_gamma=lstm_sch_gamma,
-                        trend_type=hybrid_trend)
-                else:
-                    pred_tr, fut, metr, hloss, hval = train_bilstm(
-                        inv_series_for_lstm, lookback=lstm_lookback, horizon=lstm_horizon,
-                        hidden_dim=lstm_hidden, n_layers=lstm_layers, dropout=lstm_dropout,
-                        bidirectional=lstm_bidir, lr=lstm_lr, epochs=lstm_epochs,
-                        batch_size=lstm_batch, weight_decay=lstm_wd, patience=lstm_patience,
-                        scheduler_step=lstm_sch_step, scheduler_gamma=lstm_sch_gamma)
-                prog_bar.progress(0.4, text="Modelo final OK — iniciando WFV...")
+                pred_tr, fut_inv, fut_t_off, metr, hloss = train_fukuzono(
+                    inv_v_, disp_, vel_, t_d_,
+                    seq_len=lstm_seq_len,
+                    hidden_dim=lstm_hidden, n_layers=lstm_layers,
+                    dropout=lstm_dropout, bidirectional=lstm_bidir,
+                    lr=lstm_lr, epochs=lstm_epochs, patience=lstm_patience,
+                    reg_epochs=reg_epochs, reg_lr=reg_lr,
+                    step_hours=lstm_step_h, max_steps=lstm_max_steps,
+                    stop_threshold=lstm_stop_thr,
+                    progress_cb=lambda f: prog_bar.progress(f, text=f"Entrenando... {f*100:.0f}%"))
 
-                if use_wfv and len(inv_series_for_lstm) >= n_min * 2:
-                    try:
-                        def _vid_wfv_cb(frac, _pb=prog_bar, _n=_wfv_splits):
-                            _pb.progress(0.4 + frac * 0.6,
-                                         text=f"Walk-Forward Validation — fold {int(frac*_n)}/{_n}")
-                        wfv_res_vid = walk_forward_validation(
-                            inv_series_for_lstm, lookback=lstm_lookback,
-                            hidden_dim=lstm_hidden, horizon=lstm_horizon,
-                            n_layers=lstm_layers, dropout=lstm_dropout,
-                            bidirectional=lstm_bidir, lr=lstm_lr, epochs=_wfv_ep,
-                            batch_size=lstm_batch, weight_decay=lstm_wd, patience=_wfv_pat,
-                            scheduler_step=lstm_sch_step, scheduler_gamma=lstm_sch_gamma,
-                            n_splits=_wfv_splits, min_train_frac=_wfv_minfrac,
-                            progress_cb=_vid_wfv_cb)
-                    except Exception as e:
-                        st.warning(f"WFV no pudo completarse: {e}")
-
-                prog_bar.progress(1.0, text="¡Entrenamiento completado!")
+                prog_bar.progress(1.0, text="¡Completado!")
                 st.session_state["lstm_result"] = (
-                    pred_tr, fut, metr, hloss, hval,
-                    ts_iv_lstm, inv_lstm_seg, lstm_horizon,
-                    wfv_res_vid, trend_info_vid)
+                    pred_tr, fut_inv, fut_t_off, metr, hloss,
+                    ts_iv_lstm[:_n], inv_v_)
             except Exception as e:
                 prog_bar.empty()
-                st.error(f"Error en BiLSTM: {e}")
+                st.error(f"Error en FukuzonoLSTM: {e}")
                 st.session_state["lstm_result"] = None
 
     lr_res = st.session_state["lstm_result"]
     if lr_res:
-        if len(lr_res) == 10:
-            pred_tr, fut, metr, hloss, hval, ts_lstm, iv_lstm, _hor, _wfv_vid, _trend_vid = lr_res
-        else:
-            pred_tr, fut, metr, hloss = lr_res[0], lr_res[1], lr_res[2], lr_res[3]
-            hval = lr_res[4] if len(lr_res) > 4 else None
-            ts_lstm = lr_res[5] if len(lr_res) > 5 else ts_iv_lstm
-            iv_lstm = lr_res[6] if len(lr_res) > 6 else inv_lstm_seg
-            _hor = lr_res[7] if len(lr_res) > 7 else lstm_horizon
-            _wfv_vid = lr_res[8] if len(lr_res) > 8 else None
-            _trend_vid = lr_res[9] if len(lr_res) > 9 else None
+        pred_tr, fut_inv, fut_t_off, metr, hloss, ts_lstm, iv_lstm = lr_res
 
-        _lf = _wfv_vid.get("last_forecast") if _wfv_vid else None
-        _lf_ok = _lf and "error" not in _lf
-        _fut_show   = _lf["future_vals"]   if _lf_ok else fut
-        _pred_show  = _lf["pred_full"]     if _lf_ok else pred_tr
-        _metr_show  = _lf["metrics"]       if _lf_ok else metr
-        _hloss_show = _lf["history_loss"]  if _lf_ok else hloss
-        _hval_show  = _lf.get("history_val") if _lf_ok else hval
+        fig_main = build_fukuzono_figure(
+            ts_lstm, iv_lstm, pred_tr,
+            fut_t_off * 86400.0, fut_inv, metr, hloss, lstm_stop_thr)
+        st.plotly_chart(fig_main, use_container_width=True, key="vid_fuku_main")
 
-        if _trend_vid is not None:
-            fig_main = build_hybrid_figure(ts_lstm, iv_lstm, _pred_show, _fut_show,
-                _trend_vid, _metr_show, _hloss_show, _hor, history_val=_hval_show)
-            all_r2 = _trend_vid.get("all_r2", {})
-            r2_str = "  |  ".join(f"**{k}** R²={v:.3f}" for k, v in
-                                   sorted(all_r2.items(), key=lambda x: -x[1]))
-            st.caption(f"Tendencias evaluadas → {r2_str}")
-        else:
-            fig_main = build_lstm_figure(ts_lstm, iv_lstm, _pred_show, _fut_show,
-                _metr_show, _hloss_show, _hor, history_val=_hval_show)
-
-        st.plotly_chart(fig_main, use_container_width=True, key="vid_lstm_main")
-
-        if _lf_ok:
-            st.info("**Pronóstico activo: WFV calibrado (toda la serie)**")
-
-        st.markdown("**Métricas modelo activo**")
         mc1, mc2, mc3, mc4 = st.columns(4)
-        mc1.metric("MAE",  f"{_metr_show['MAE']:.5f}")
-        mc2.metric("RMSE", f"{_metr_show['RMSE']:.5f}")
-        mc3.metric("MAPE", f"{_metr_show['MAPE']:.2f}%")
-        mc4.metric("R²",   f"{_metr_show['R2']:.4f}")
+        mc1.metric("MAE",  f"{metr['MAE']:.5f}")
+        mc2.metric("RMSE", f"{metr['RMSE']:.5f}")
+        mc3.metric("MAPE", f"{metr['MAPE']:.2f}%")
+        mc4.metric("R²",   f"{metr['R2']:.4f}")
 
-        if _trend_vid is not None:
-            st.caption(f"Tendencia: **{_trend_vid['trend_type']}** "
-                       f"(R²={_trend_vid['r2']:.4f}) · BiLSTM sobre residuo")
-
-        if _wfv_vid:
-            _agg = _wfv_vid["agg"]
-            st.markdown("**Validación Cruzada Walk-Forward**")
-            st.caption(f"{_agg['n_folds']} folds completados")
-            wc1, wc2, wc3, wc4 = st.columns(4)
-            wc1.metric("MAE WFV",  f"{_agg['MAE_mean']:.5f}", delta=f"±{_agg['MAE_std']:.5f}")
-            wc2.metric("RMSE WFV", f"{_agg['RMSE_mean']:.5f}", delta=f"±{_agg['RMSE_std']:.5f}")
-            wc3.metric("MAPE WFV", f"{_agg['MAPE_mean']:.2f}%", delta=f"±{_agg['MAPE_std']:.2f}%")
-            wc4.metric("R² WFV",   f"{_agg['R2_mean']:.4f}", delta=f"±{_agg['R2_std']:.4f}")
-            fig_wfv_v = build_wfv_figure(_wfv_vid, iv_lstm, title="Video/Imágenes")
-            st.plotly_chart(fig_wfv_v, use_container_width=True, key="vid_wfv_fig")
-            with st.expander("Tabla detallada por fold"):
-                import pandas as _pd_v
-                _rows = []
-                for _f in _wfv_vid["folds"]:
-                    if "error" in _f:
-                        _rows.append({"Fold": _f["fold"],
-                            "Estado": f"Error: {_f['error']}",
-                            "MAE":"—","RMSE":"—","MAPE":"—","R²":"—",
-                            "Train pts":"—","Test pts":"—"})
-                    else:
-                        _rows.append({"Fold": _f["fold"], "Estado": "✓",
-                            "MAE": f"{_f['mae']:.5f}", "RMSE": f"{_f['rmse']:.5f}",
-                            "MAPE": f"{_f['mape']:.2f}%", "R²": f"{_f['r2']:.4f}",
-                            "Train pts": _f["train_size"], "Test pts": _f["test_size"]})
-                st.dataframe(_pd_v.DataFrame(_rows), use_container_width=True, hide_index=True)
-        else:
-            st.caption("Serie demasiado corta para Walk-Forward Validation.")
+        if len(fut_inv) > 0:
+            st.info(
+                f"**Falla proyectada:** offset {fut_t_off[-1]*24:.1f} horas desde el último dato  |  "
+                f"Pasos autorregresivos: {len(fut_inv)}  |  "
+                f"1/v final: {fut_inv[-1]:.5f}")
 
         with st.expander("Detalles del modelo y pronóstico"):
             import pandas as pd
-            c_a, c_b = st.columns(2)
-            with c_a:
+            ca, cb = st.columns(2)
+            with ca:
                 st.markdown(f"""
 | Parámetro | Valor |
 |-----------|-------|
-| Lookback  | {metr['lookback']} |
-| Horizon   | {metr['horizon']} |
+| Seq length | {metr['seq_len']} |
 | Hidden dim | {metr['hidden_dim']} |
 | Capas LSTM | {metr['n_layers']} |
 | Bidireccional | {metr['bidirectional']} |
-| Dropout | {metr['dropout']} |
-| LR | {metr['lr']:.0e} |
 | Parámetros totales | {metr['n_params']:,} |
 | Epochs ejecutados | {metr['epochs_run']} |
 | Mejor val loss | {metr['best_val_loss']:.6f} |
 """)
-            with c_b:
-                dt = float(np.mean(np.diff(ts_lstm))) if len(ts_lstm) > 1 else 1.0
-                t_fut = ts_lstm[-1] + np.arange(1, _hor + 1) * dt
-                _fut_table = _lf["future_vals"] if _lf_ok else fut
-                st.caption("Pronóstico WFV" if _lf_ok else "Pronóstico modelo final")
-                df_fut = pd.DataFrame({
-                    "Paso": list(range(1, _hor + 1)),
-                    "t (s)": [f"{t:.2f}" for t in t_fut],
-                    "1/v predicho": [f"{v:.5f}" for v in _fut_table],
-                    "v estimada px/frame": [f"{1/(v+1e-9):.3f}" for v in _fut_table]})
-                st.dataframe(df_fut, use_container_width=True)
+            with cb:
+                _dt = pd.DataFrame({
+                    "Paso": list(range(1, len(fut_inv) + 1)),
+                    "Offset (h)": np.round(fut_t_off * 24, 1),
+                    "1/v proyectado": np.round(fut_inv, 5),
+                    "v estimada (px/s)": np.round(1.0 / (fut_inv + 1e-8), 5),
+                })
+                st.dataframe(_dt, use_container_width=True, hide_index=True)
 
-    # Comparación personalizada de frames
+    # ── Comparación personalizada de frames ───────────────────────────────────
     st.divider()
     st.subheader("🔄 Comparación personalizada de frames")
 
@@ -3018,4 +2222,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
