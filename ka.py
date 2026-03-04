@@ -1154,13 +1154,28 @@ def build_fukuzono_figure(x_real, inv_v_real, pred_train,
             name="Proyección autorregresiva",
             line=dict(color=GREEN, width=2.2), marker=dict(size=5)), row=1, col=1)
 
+        
         # Línea roja SOLO si cruza 0 (falla real)
         crossed_zero = future_inv_v[-1] <= 0.0
         if crossed_zero:
-            fig.add_vline(x=x_fut[-1] if not isinstance(x_fut[-1], str) else x_fut[-1],
-                          line_dash="dot", line_color="red",
-                          annotation_text="FALLA (1/v = 0)",
-                          annotation_font_color="red", row=1, col=1)
+            _xf = x_fut[-1]
+            if isinstance(_xf, str):
+                fig.add_shape(type="line",
+                              x0=_xf, x1=_xf, y0=0, y1=1,
+                              xref="x", yref="paper",
+                              line=dict(dash="dot", color="red", width=1.5),
+                              row=1, col=1)
+                fig.add_annotation(x=_xf, y=1, xref="x", yref="paper",
+                                   text="FALLA (1/v = 0)",
+                                   font=dict(color="red", size=11),
+                                   showarrow=False, yanchor="bottom",
+                                   row=1, col=1)
+            else:
+                fig.add_vline(x=float(_xf),
+                              line_dash="dot", line_color="red",
+                              annotation_text="FALLA (1/v = 0)",
+                              annotation_font_color="red", row=1, col=1)   
+        
 
     # Línea Y=0 (referencia de falla)
     fig.add_hline(y=0, line_dash="dot", line_color="red",
@@ -2453,3 +2468,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
