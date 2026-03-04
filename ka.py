@@ -19,9 +19,6 @@ from scipy.signal import savgol_filter, butter, filtfilt
 from scipy.ndimage import uniform_filter1d
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 warnings.filterwarnings("ignore")
 
@@ -61,8 +58,6 @@ PLOTLY_LAYOUT = dict(
     legend=dict(bgcolor=BG2, bordercolor=BORDER),
     margin=dict(l=60, r=20, t=50, b=50),
 )
-
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ════════════════════════════════════════════════════════════════════════════
 #  FLUJO ÓPTICO — sin cambios
@@ -506,7 +501,7 @@ def build_decomposition_figure(decomp, title, y_label="Valor", timestamps=None):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  FUKUZONO LSTM — PyTorch (nuevo modelo)
+#  FUKUZONO LSTM — NumPy puro (BiLSTM + SelfAttention + cabeza regresión)
 # ════════════════════════════════════════════════════════════════════════════
 
 N_FEATURES_FUKU = 14
@@ -599,247 +594,453 @@ def engineer_features_fuku(inv_v_arr, disp_arr, vel_arr, t_days_arr,
     return np.nan_to_num(feats, nan=0.0, posinf=5.0, neginf=-5.0)
 
 
-class SelfAttention(nn.Module):
-    def __init__(self, hidden_dim):
-        super().__init__()
-        self.attn = nn.Linear(hidden_dim, 1)
+# ── Primitivas numéricas ──────────────────────────────────────────────────────
+
+def _sigmoid(x):
+    x = np.clip(x, -30, 30)
+    return np.where(x >= 0,
+                    1.0 / (1.0 + np.exp(-x)),
+                    np.exp(x) / (1.0 + np.exp(x)))
+
+def _tanh(x):    return np.tanh(np.clip(x, -15, 15))
+def _gelu(x):    return x * _sigmoid(1.702 * x)   # aproximación rápida
+def _dsigmoid(s): return s * (1.0 - s)
+def _dtanh(t):    return 1.0 - t ** 2
+
+def _xavier(n_in, n_out, rng):
+    lim = np.sqrt(6.0 / (n_in + n_out))
+    return rng.uniform(-lim, lim, (n_in, n_out)).astype(np.float64)
+
+def _layer_norm(x, eps=1e-5):
+    mu = x.mean(); std = x.std() + eps
+    return (x - mu) / std
+
+# ── Adam por variable ─────────────────────────────────────────────────────────
+
+class _Adam:
+    def __init__(self, shape, lr=1e-3, b1=0.9, b2=0.999, eps=1e-8, wd=0.0):
+        self.lr = lr; self.b1 = b1; self.b2 = b2; self.eps = eps; self.wd = wd
+        self.m = np.zeros(shape); self.v = np.zeros(shape); self.t = 0
+    def step(self, w, g):
+        self.t += 1
+        g = g + self.wd * w
+        self.m = self.b1 * self.m + (1 - self.b1) * g
+        self.v = self.b2 * self.v + (1 - self.b2) * g ** 2
+        mh = self.m / (1 - self.b1 ** self.t)
+        vh = self.v / (1 - self.b2 ** self.t)
+        return w - self.lr * mh / (np.sqrt(vh) + self.eps)
+    def set_lr(self, lr): self.lr = lr
+
+# ── Celda LSTM ────────────────────────────────────────────────────────────────
+
+class _LSTMCell:
+    def __init__(self, inp, hid, rng, lr, wd):
+        self.H = hid
+        self.W  = _xavier(inp + hid, 4 * hid, rng)
+        self.b  = np.zeros(4 * hid)
+        self.aW = _Adam(self.W.shape, lr=lr, wd=wd)
+        self.ab = _Adam(self.b.shape, lr=lr, wd=wd)
+
+    def forward(self, x_seq):
+        T = len(x_seq); H = self.H
+        h = np.zeros(H); c = np.zeros(H)
+        hs, cs, gpost, xhs = [], [], [], []
+        for t in range(T):
+            xh = np.concatenate([x_seq[t], h])
+            g  = xh @ self.W + self.b
+            i_ = _sigmoid(g[:H]); f_ = _sigmoid(g[H:2*H])
+            o_ = _sigmoid(g[2*H:3*H]); g_ = _tanh(g[3*H:])
+            c  = f_ * c + i_ * g_
+            h  = o_ * _tanh(c)
+            gpost.append((i_, f_, o_, g_)); cs.append(c.copy())
+            hs.append(h.copy()); xhs.append(xh)
+        return np.array(hs), (xhs, gpost, cs, np.array(hs))
+
+    def backward(self, dh_seq, cache):
+        xhs, gpost, cs, _ = cache
+        T = len(dh_seq); H = self.H
+        dW = np.zeros_like(self.W); db = np.zeros_like(self.b)
+        dh_next = np.zeros(H); dc_next = np.zeros(H)
+        for t in reversed(range(T)):
+            dh = dh_seq[t] + dh_next
+            i_, f_, o_, g_ = gpost[t]
+            c_prev = cs[t - 1] if t > 0 else np.zeros(H)
+            c_cur  = f_ * c_prev + i_ * g_
+            tc = _tanh(c_cur)
+            dc = dh * o_ * _dtanh(tc) + dc_next
+            dg_pre = np.concatenate([
+                dc * g_  * _dsigmoid(i_),
+                dc * c_prev * _dsigmoid(f_),
+                dh * tc * _dsigmoid(o_),
+                dc * i_  * _dtanh(g_)])
+            dxh = dg_pre @ self.W.T
+            dW += np.outer(xhs[t], dg_pre)
+            db += dg_pre
+            dh_next = dxh[xhs[t].shape[0] - H:]
+            dc_next = dc * f_
+        np.clip(dW, -1, 1, out=dW); np.clip(db, -1, 1, out=db)
+        self.W = self.aW.step(self.W, dW)
+        self.b = self.ab.step(self.b, db)
+
+# ── Proyección densa ──────────────────────────────────────────────────────────
+
+class _Dense:
+    def __init__(self, n_in, n_out, rng, lr, wd, act="linear"):
+        self.W = _xavier(n_in, n_out, rng); self.b = np.zeros(n_out)
+        self.act = act
+        self.aW = _Adam(self.W.shape, lr=lr, wd=wd)
+        self.ab = _Adam(self.b.shape, lr=lr, wd=wd)
+        self._x = None; self._z = None
 
     def forward(self, x):
-        w = F.softmax(self.attn(x).squeeze(-1), dim=1).unsqueeze(2)
-        return (x * w).sum(dim=1), w.squeeze(2)
+        self._x = x.copy(); z = x @ self.W + self.b; self._z = z.copy()
+        if self.act == "gelu": return _gelu(z)
+        if self.act == "tanh": return _tanh(z)
+        return z
+
+    def backward(self, dout):
+        if self.act == "gelu":
+            sg = _sigmoid(1.702 * self._z)
+            dout = dout * (sg + 1.702 * self._z * sg * (1 - sg))
+        elif self.act == "tanh":
+            dout = dout * _dtanh(_tanh(self._z))
+        dW = np.outer(self._x, dout); np.clip(dW, -1, 1, out=dW)
+        self.W = self.aW.step(self.W, dW)
+        self.b = self.ab.step(self.b, dout)
+        return dout @ self.W.T
+
+# ── Self-attention (pesos aprendidos por backprop) ────────────────────────────
+
+class _Attention:
+    def __init__(self, dim, rng, lr, wd):
+        self.W = _xavier(dim, 1, rng); self.b = np.zeros(1)
+        self.aW = _Adam(self.W.shape, lr=lr, wd=wd)
+        self.ab = _Adam(self.b.shape, lr=lr, wd=wd)
+        self._hs = None; self._w = None
+
+    def forward(self, hs):
+        """hs: [T, dim] → ctx: [dim]"""
+        self._hs = hs
+        scores = hs @ self.W + self.b          # [T, 1]
+        scores = scores - scores.max()
+        exp_s  = np.exp(scores.ravel())
+        self._w = exp_s / (exp_s.sum() + 1e-8)  # [T]
+        return (hs * self._w[:, None]).sum(axis=0)  # [dim]
+
+    def backward(self, dctx):
+        w = self._w; T = len(w)
+        # dL/dhs_i = w_i * dctx + w_i*(1-w_i)*dctx·hs_i * hs_i_adj (simplified)
+        dhs = w[:, None] * dctx[None, :]   # [T, dim]
+        dscores = (dhs * self._hs).sum(axis=1)   # [T]
+        dscores = dscores - (w * dscores).sum()  # softmax backward
+        dW = self._hs.T @ dscores[:, None]       # [dim, 1]
+        db = dscores.sum(keepdims=True)
+        np.clip(dW, -1, 1, out=dW)
+        self.W = self.aW.step(self.W, dW)
+        self.b = self.ab.step(self.b, db)
+        return dhs
+
+# ── FukuzonoLSTM numpy completo ───────────────────────────────────────────────
+
+class _FukuzonoNumpy:
+    """
+    input_proj (n_feat → hid, GELU) →
+    BiLSTM (fwd + bwd, hid cada uno) →
+    SelfAttention (2*hid → 2*hid) →
+    Dense(2*hid → 64, GELU) →
+    Dense(64 → 1, linear)
+    """
+    def __init__(self, n_feat, hid, lr, wd, rng, bidirectional=True):
+        self.hid = hid; self.bidir = bidirectional
+        ctx_dim = hid * (2 if bidirectional else 1)
+
+        # input projection
+        self.proj   = _Dense(n_feat, hid, rng, lr, wd, act="gelu")
+        # BiLSTM
+        self.lstm_f = _LSTMCell(hid, hid, rng, lr, wd)
+        self.lstm_b = _LSTMCell(hid, hid, rng, lr, wd) if bidirectional else None
+        # attention
+        self.attn   = _Attention(ctx_dim, rng, lr, wd)
+        # head
+        self.d1 = _Dense(ctx_dim, 64, rng, lr, wd, act="gelu")
+        self.d2 = _Dense(64, 1, rng, lr, wd, act="linear")
+
+        n_params = (n_feat * hid + hid +          # proj
+                    (hid + hid) * 4 * hid + 4 * hid +  # lstm_f
+                    (hid + hid) * 4 * hid + 4 * hid +  # lstm_b
+                    ctx_dim + 1 +                  # attn
+                    ctx_dim * 64 + 64 +            # d1
+                    64 + 1)                        # d2
+        self.n_params = n_params
+
+    def forward(self, x_seq, training=False, dropout=0.0, rng_d=None):
+        """x_seq: [T, n_feat] → scalar, cache"""
+        T = len(x_seq)
+        # projection
+        proj_out = np.array([self.proj.forward(x_seq[t]) for t in range(T)])
+        # fwd lstm
+        h_f, cache_f = self.lstm_f.forward(proj_out)
+        # bwd lstm
+        if self.bidir:
+            h_b, cache_b = self.lstm_b.forward(proj_out[::-1])
+            h_b = h_b[::-1]
+            hs = np.concatenate([h_f, h_b], axis=1)  # [T, 2*hid]
+        else:
+            hs = h_f; cache_b = None
+        # layer norm
+        hs_norm = np.array([_layer_norm(hs[t]) for t in range(T)])
+        # attention
+        ctx = self.attn.forward(hs_norm)
+        # dropout on ctx (training only)
+        if training and dropout > 0 and rng_d is not None:
+            mask = (rng_d.rand(len(ctx)) > dropout).astype(np.float64) / (1 - dropout)
+            ctx  = ctx * mask
+        else:
+            mask = None
+        # head
+        h1  = self.d1.forward(ctx)
+        out = self.d2.forward(h1)
+        cache = (cache_f, cache_b, hs_norm, ctx, mask, proj_out, x_seq)
+        return float(out[0]), cache
+
+    def backward(self, dy, cache, dropout=0.0):
+        cache_f, cache_b, hs_norm, ctx, mask, proj_out, x_seq = cache
+        T = len(hs_norm)
+        dout = np.array([dy])
+        dh1  = self.d2.backward(dout)
+        dctx = self.d1.backward(dh1)
+        if mask is not None:
+            dctx = dctx * mask
+        # attention backward
+        dhs_norm = self.attn.backward(dctx)
+        # layer norm backward (approximate: identity)
+        dhs = dhs_norm
+        # split fwd/bwd
+        hid = self.hid
+        dh_f_all = dhs[:, :hid]; dh_b_all = dhs[:, hid:] if self.bidir else None
+        # lstm fwd backward
+        dh_f_seq = np.zeros((T, hid)); dh_f_seq[-1] = dh_f_all[-1]
+        self.lstm_f.backward(dh_f_seq, cache_f)
+        # lstm bwd backward
+        if self.bidir:
+            dh_b_seq = np.zeros((T, hid)); dh_b_seq[0] = dh_b_all[0]
+            self.lstm_b.backward(dh_b_seq[::-1], cache_b)
+        # proj backward — no need to propagate further
+
+    def set_lr(self, lr):
+        for obj in [self.proj, self.lstm_f, self.lstm_b, self.attn, self.d1, self.d2]:
+            if obj is None: continue
+            for attr in ["aW", "ab"]:
+                if hasattr(obj, attr): getattr(obj, attr).set_lr(lr)
 
 
-class FukuzonoLSTM(nn.Module):
-    def __init__(self, n_features=N_FEATURES_FUKU, hidden_dim=128,
-                 n_layers=2, dropout=0.40, bidirectional=True):
-        super().__init__()
-        self.n_dirs = 2 if bidirectional else 1
-        self.hidden_dim = hidden_dim
-        self.input_proj = nn.Sequential(
-            nn.Linear(n_features, hidden_dim), nn.LayerNorm(hidden_dim),
-            nn.GELU(), nn.Dropout(dropout * 0.5)
-        )
-        self.lstm = nn.LSTM(hidden_dim, hidden_dim, n_layers,
-                            batch_first=True,
-                            dropout=dropout if n_layers > 1 else 0.0,
-                            bidirectional=bidirectional)
-        self.lstm_norm = nn.LayerNorm(hidden_dim * self.n_dirs)
-        self.attention  = SelfAttention(hidden_dim * self.n_dirs)
-        self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim * self.n_dirs, 128), nn.LayerNorm(128),
-            nn.GELU(), nn.Dropout(dropout),
-            nn.Linear(128, 64), nn.LayerNorm(64),
-            nn.GELU(), nn.Dropout(dropout * 0.5),
-            nn.Linear(64, 1)
-        )
-
-    def forward(self, x):
-        xp = self.input_proj(x)
-        lo, _ = self.lstm(xp)
-        lo = self.lstm_norm(lo)
-        ctx, attn = self.attention(lo)
-        return self.classifier(ctx).squeeze(-1), ctx
+def _huber(pred, target, delta=0.5):
+    r = pred - target; ar = abs(r)
+    loss = 0.5 * r**2 if ar <= delta else delta * (ar - 0.5 * delta)
+    grad = r if ar <= delta else delta * np.sign(r)
+    return loss, grad
 
 
 def train_fukuzono(inv_v_arr, disp_arr, vel_arr, t_days_arr,
-                   seq_len=20, hidden_dim=128, n_layers=2,
-                   dropout=0.30, bidirectional=True,
-                   lr=1e-3, epochs=300, patience=30,
-                   reg_epochs=200, reg_lr=1e-3,
+                   seq_len=20, hidden_dim=64, n_layers=1,
+                   dropout=0.20, bidirectional=True,
+                   lr=1e-3, epochs=200, patience=30,
+                   reg_epochs=150, reg_lr=1e-3,
                    step_hours=24.0, max_steps=120,
                    stop_threshold=0.5,
                    progress_cb=None):
     """
-    Entrena FukuzonoLSTM completo desde cero (sin pesos previos).
-    Devuelve: pred_train, future_inv_v, future_ts_offsets, metrics, history_loss
+    Entrena FukuzonoLSTM numpy puro (BiLSTM + SelfAttention + cabeza regresión).
+    Fase 1: entrenamiento end-to-end.
+    Fase 2: fine-tune solo cabeza (BiLSTM congelado).
+    Fase 3: loop autorregresivo hasta 1/v ≤ stop_threshold.
     """
-    torch.manual_seed(42)
-    np.random.seed(42)
-
+    rng = np.random.RandomState(42)
     n = len(inv_v_arr)
     feats_all = engineer_features_fuku(inv_v_arr, disp_arr, vel_arr, t_days_arr)
+    seq_len   = min(seq_len, max(3, n - 2))
 
-    seq_len = min(seq_len, max(3, n - 2))
-
-    # Construir ventanas
     X_list, y_list = [], []
     for i in range(n - seq_len):
-        X_list.append(feats_all[i: i + seq_len])
-        y_list.append(inv_v_arr[i + seq_len])
+        X_list.append(feats_all[i: i + seq_len].astype(np.float64))
+        y_list.append(float(inv_v_arr[i + seq_len]))
 
     if len(X_list) < 4:
         raise ValueError(f"Serie demasiado corta ({n} puntos). Necesitas al menos {seq_len + 4}.")
 
-    X_all = torch.tensor(np.array(X_list), dtype=torch.float32).to(DEVICE)
-    y_all = torch.tensor(np.array(y_list), dtype=torch.float32).to(DEVICE)
+    X_all = np.array(X_list)
+    y_all = np.array(y_list)
+    y_mean = y_all.mean(); y_std = y_all.std() + 1e-8
+    y_sc   = (y_all - y_mean) / y_std
 
-    y_mean = float(y_all.mean())
-    y_std  = float(y_all.std()) + 1e-8
-    y_scaled = (y_all - y_mean) / y_std
+    split  = max(2, int(len(X_all) * 0.85))
+    X_tr, y_tr = X_all[:split], y_sc[:split]
+    X_val, y_val = X_all[split:], y_sc[split:]
 
-    # Split train/val
-    split = max(2, int(len(X_all) * 0.85))
-    X_tr, y_tr = X_all[:split], y_scaled[:split]
-    X_val, y_val = X_all[split:], y_scaled[split:]
-
-    # ── Modelo completo (entrenamiento end-to-end) ──
-    model = FukuzonoLSTM(n_features=N_FEATURES_FUKU, hidden_dim=hidden_dim,
-                         n_layers=n_layers, dropout=dropout,
-                         bidirectional=bidirectional).to(DEVICE)
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=max(10, epochs//8), gamma=0.6)
-    loss_fn   = nn.HuberLoss(delta=0.5)
-
-    history_loss = []
-    best_val = np.inf
-    best_state = None
-    wait = 0
-
+    model = _FukuzonoNumpy(N_FEATURES_FUKU, hidden_dim, lr, 1e-4, rng, bidirectional)
     total_ep = epochs + reg_epochs
+    history_loss = []
+    best_val = np.inf; best_snap = None; wait = 0
+    sched_step = max(10, epochs // 6); current_lr = lr
 
+    # ── Fase 1: end-to-end ──────────────────────────────────────────────────
     for ep in range(epochs):
-        model.train()
-        optimizer.zero_grad()
-        preds, _ = model(X_tr)
-        loss = loss_fn(preds, y_tr)
-        loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        scheduler.step()
-        history_loss.append(float(loss))
+        if ep > 0 and ep % sched_step == 0:
+            current_lr *= 0.6
+            model.set_lr(current_lr)
 
-        if len(X_val) > 0:
-            model.eval()
-            with torch.no_grad():
-                vp, _ = model(X_val)
-                val_loss = float(loss_fn(vp, y_val))
-        else:
-            val_loss = float(loss)
+        idx = rng.permutation(len(X_tr))
+        ep_loss = 0.0
+        for i in idx:
+            pred, cache = model.forward(X_tr[i], training=True,
+                                        dropout=dropout, rng_d=rng)
+            loss, grad  = _huber(pred, y_tr[i])
+            model.backward(grad, cache, dropout=dropout)
+            ep_loss += loss
+        ep_loss /= len(X_tr)
+        history_loss.append(ep_loss)
+
+        val_loss = np.mean([_huber(model.forward(X_val[j])[0], y_val[j])[0]
+                            for j in range(len(X_val))]) if len(X_val) > 0 else ep_loss
 
         if val_loss < best_val:
-            best_val = val_loss
-            best_state = {k: v.clone() for k, v in model.state_dict().items()}
-            wait = 0
+            best_val = val_loss; wait = 0
+            # snapshot ligero: guardar parámetros del head únicamente
+            best_snap = {
+                "d1W": model.d1.W.copy(), "d1b": model.d1.b.copy(),
+                "d2W": model.d2.W.copy(), "d2b": model.d2.b.copy(),
+                "aW":  model.attn.W.copy(), "ab": model.attn.b.copy(),
+            }
         else:
             wait += 1
-            if wait >= patience:
-                break
+            if wait >= patience: break
 
         if progress_cb:
-            progress_cb((ep + 1) / total_ep * 0.6)
+            progress_cb((ep + 1) / total_ep * 0.55)
 
-    if best_state:
-        model.load_state_dict(best_state)
+    # ── Fase 2: fine-tune solo cabeza (no backprop al BiLSTM) ───────────────
+    # Pre-calcular embeddings (ctx) con el BiLSTM congelado
+    ctxs_tr = []
+    for i in range(len(X_tr)):
+        _, cache_i = model.forward(X_tr[i])
+        ctxs_tr.append(cache_i[3].copy())  # ctx es cache[3]
+    ctxs_tr = np.array(ctxs_tr)
 
-    # ── Cabeza de regresión fine-tuning (congelar BiLSTM) ──
-    for p in model.lstm.parameters():
-        p.requires_grad = False
-    for p in model.input_proj.parameters():
-        p.requires_grad = False
+    # Cabeza separada para fine-tune
+    rng2 = np.random.RandomState(123)
+    ctx_dim = hidden_dim * (2 if bidirectional else 1)
+    head_d1 = _Dense(ctx_dim, 64, rng2, reg_lr, 1e-4, act="gelu")
+    head_d2 = _Dense(64, 1,   rng2, reg_lr, 1e-4, act="linear")
 
-    reg_head = nn.Sequential(
-        nn.Linear(hidden_dim * (2 if bidirectional else 1), 64),
-        nn.GELU(),
-        nn.Linear(64, 1)
-    ).to(DEVICE)
+    best_val2 = np.inf; best_snap2 = None; wait2 = 0
+    sched2 = max(10, reg_epochs // 5); clr2 = reg_lr
 
-    opt_reg = torch.optim.Adam(
-        list(reg_head.parameters()) + list(model.attention.parameters()),
-        lr=reg_lr)
+    # Pre-calc val ctxs
+    ctxs_val = []
+    for j in range(len(X_val)):
+        _, cache_j = model.forward(X_val[j])
+        ctxs_val.append(cache_j[3].copy())
+    ctxs_val = np.array(ctxs_val) if len(ctxs_val) > 0 else np.zeros((0, ctx_dim))
 
     for ep2 in range(reg_epochs):
-        model.eval()
-        reg_head.train()
-        opt_reg.zero_grad()
-        with torch.no_grad():
-            _, emb = model(X_tr)
-        preds_reg = reg_head(emb).squeeze(-1)
-        loss_reg = loss_fn(preds_reg, y_tr)
-        loss_reg.backward()
-        nn.utils.clip_grad_norm_(reg_head.parameters(), 1.0)
-        opt_reg.step()
-        history_loss.append(float(loss_reg))
+        if ep2 > 0 and ep2 % sched2 == 0:
+            clr2 *= 0.6
+            head_d1.aW.set_lr(clr2); head_d1.ab.set_lr(clr2)
+            head_d2.aW.set_lr(clr2); head_d2.ab.set_lr(clr2)
+
+        idx2 = rng2.permutation(len(ctxs_tr))
+        ep_loss2 = 0.0
+        for i in idx2:
+            h1 = head_d1.forward(ctxs_tr[i])
+            p  = float(head_d2.forward(h1)[0])
+            loss2, grad2 = _huber(p, y_tr[i])
+            dh1 = head_d2.backward(np.array([grad2]))
+            head_d1.backward(dh1)
+            ep_loss2 += loss2
+        ep_loss2 /= max(1, len(ctxs_tr))
+        history_loss.append(ep_loss2)
+
+        if len(ctxs_val) > 0:
+            vl2 = np.mean([_huber(float(head_d2.forward(head_d1.forward(ctxs_val[j]))[0]),
+                                   y_val[j])[0] for j in range(len(ctxs_val))])
+        else:
+            vl2 = ep_loss2
+
+        if vl2 < best_val2:
+            best_val2 = vl2; wait2 = 0
+            best_snap2 = {"d1W": head_d1.W.copy(), "d1b": head_d1.b.copy(),
+                          "d2W": head_d2.W.copy(), "d2b": head_d2.b.copy()}
+        else:
+            wait2 += 1
+            if wait2 >= patience: break
+
         if progress_cb:
-            progress_cb(0.6 + (ep2 + 1) / reg_epochs * 0.35)
+            progress_cb(0.55 + (ep2 + 1) / reg_epochs * 0.35)
 
-    # ── Predicciones en train ──
-    model.eval()
-    reg_head.eval()
-    with torch.no_grad():
-        _, emb_all = model(X_all)
-        preds_all_sc = reg_head(emb_all).squeeze(-1)
-    preds_all_real = (preds_all_sc.cpu().numpy() * y_std + y_mean)
+    # Restaurar mejor cabeza
+    if best_snap2:
+        head_d1.W = best_snap2["d1W"]; head_d1.b = best_snap2["d1b"]
+        head_d2.W = best_snap2["d2W"]; head_d2.b = best_snap2["d2b"]
 
+    def _predict_one(x_seq):
+        _, cache = model.forward(x_seq)
+        ctx = cache[3]
+        h1  = head_d1.forward(ctx)
+        return float(head_d2.forward(h1)[0])
+
+    # ── Predicciones sobre datos reales ──────────────────────────────────────
     pred_train = np.full(n, np.nan)
-    for i, pv in enumerate(preds_all_real):
+    for i in range(len(X_all)):
+        pv = _predict_one(X_all[i]) * y_std + y_mean
         pred_train[i + seq_len] = max(0.0, pv)
 
-    # ── Loop autorregresivo ──
+    # ── Loop autorregresivo ──────────────────────────────────────────────────
     buf_inv_v = list(inv_v_arr.astype(float))
     buf_disp  = list(disp_arr.astype(float))
     buf_vel   = list(vel_arr.astype(float))
     buf_t     = list(t_days_arr.astype(float))
 
-    future_inv_v = []
-    future_t_off = []  # offsets en días desde el último punto real
-
-    dt_mean = float(np.mean(np.diff(t_days_arr))) if len(t_days_arr) > 1 else step_hours / 24.0
+    future_inv_v = []; future_t_off = []
     step_days = step_hours / 24.0
 
-    with torch.no_grad():
-        for step in range(max_steps):
-            inv_v_buf = np.array(buf_inv_v)
-            disp_buf  = np.array(buf_disp)
-            vel_buf   = np.array(buf_vel)
-            t_buf     = np.array(buf_t)
+    for step in range(max_steps):
+        feats_buf = engineer_features_fuku(
+            np.array(buf_inv_v), np.array(buf_disp),
+            np.array(buf_vel),   np.array(buf_t))
+        win = feats_buf[-seq_len:].astype(np.float64)
 
-            feats_buf = engineer_features_fuku(inv_v_buf, disp_buf, vel_buf, t_buf)
-            window = torch.tensor(
-                feats_buf[-seq_len:], dtype=torch.float32
-            ).unsqueeze(0).to(DEVICE)
+        pred_sc   = _predict_one(win)
+        next_inv_v = max(0.0, pred_sc * y_std + y_mean)
+        next_t    = buf_t[-1] + step_days
+        next_vel  = 1.0 / (next_inv_v + 1e-8)
+        next_disp = buf_disp[-1] + next_vel * step_days
 
-            _, emb = model(window)
-            pred_sc = float(reg_head(emb).squeeze())
-            next_inv_v = max(0.0, pred_sc * y_std + y_mean)
+        future_inv_v.append(next_inv_v)
+        future_t_off.append(next_t - t_days_arr[-1])
 
-            next_t   = buf_t[-1] + step_days
-            next_vel = 1.0 / (next_inv_v + 1e-8)
-            next_disp = buf_disp[-1] + next_vel * step_days
+        buf_inv_v.append(next_inv_v); buf_vel.append(next_vel)
+        buf_disp.append(next_disp);   buf_t.append(next_t)
 
-            future_inv_v.append(next_inv_v)
-            future_t_off.append(next_t - t_days_arr[-1])
+        if next_inv_v <= stop_threshold:
+            break
 
-            buf_inv_v.append(next_inv_v)
-            buf_vel.append(next_vel)
-            buf_disp.append(next_disp)
-            buf_t.append(next_t)
-
-            if next_inv_v <= stop_threshold:
-                break
-
-    if progress_cb:
-        progress_cb(1.0)
+    if progress_cb: progress_cb(1.0)
 
     # Métricas
     vm = ~np.isnan(pred_train)
-    real_seg = inv_v_arr[vm]
-    pred_seg = pred_train[vm]
-    mae  = float(np.mean(np.abs(real_seg - pred_seg)))
-    rmse = float(np.sqrt(np.mean((real_seg - pred_seg) ** 2)))
-    mape = float(np.mean(np.abs((real_seg - pred_seg) / (np.abs(real_seg) + 1e-8))) * 100)
-    ss_r = np.sum((real_seg - pred_seg) ** 2)
-    ss_t = np.sum((real_seg - real_seg.mean()) ** 2)
+    rs = inv_v_arr[vm]; ps = pred_train[vm]
+    mae  = float(np.mean(np.abs(rs - ps)))
+    rmse = float(np.sqrt(np.mean((rs - ps) ** 2)))
+    mape = float(np.mean(np.abs((rs - ps) / (np.abs(rs) + 1e-8))) * 100)
+    ss_r = np.sum((rs - ps) ** 2); ss_t = np.sum((rs - rs.mean()) ** 2)
     r2   = float(1 - ss_r / (ss_t + 1e-12))
 
-    n_params = sum(p.numel() for p in model.parameters()) + \
-               sum(p.numel() for p in reg_head.parameters())
-
     metrics = dict(MAE=mae, RMSE=rmse, MAPE=mape, R2=r2,
-                   n_params=n_params, epochs_run=len(history_loss),
-                   best_val_loss=best_val,
+                   n_params=model.n_params,
+                   epochs_run=len(history_loss),
+                   best_val_loss=float(best_val2),
                    seq_len=seq_len, hidden_dim=hidden_dim,
-                   n_layers=n_layers, bidirectional=bidirectional)
+                   n_layers=1, bidirectional=bidirectional)
 
     return pred_train, np.array(future_inv_v), np.array(future_t_off), metrics, history_loss
 
@@ -1300,23 +1501,25 @@ def main():
 
         st.divider()
         st.header("FukuzonoLSTM — Hiperparámetros")
-        lstm_seq_len  = st.slider("Seq length (ventana historia)", 5, 60, 20, 1)
-        lstm_hidden   = st.select_slider("Hidden dim", options=[32, 64, 128, 256], value=128)
-        lstm_layers   = st.slider("Capas LSTM", 1, 4, 2, 1)
-        lstm_dropout  = st.slider("Dropout", 0.0, 0.6, 0.30, 0.05)
+        st.caption("Modelo NumPy puro: BiLSTM + Self-Attention + cabeza de regresión")
+        lstm_seq_len  = st.slider("Seq length (ventana historia)", 5, 40, 15, 1)
+        lstm_hidden   = st.select_slider("Hidden dim", options=[16, 32, 48, 64], value=32)
+        lstm_dropout  = st.slider("Dropout", 0.0, 0.5, 0.20, 0.05)
         lstm_bidir    = st.checkbox("Bidireccional", value=True)
         lstm_lr       = st.select_slider("Learning rate (BiLSTM)",
-                          options=[1e-4, 3e-4, 5e-4, 1e-3, 3e-3, 5e-3],
+                          options=[1e-4, 3e-4, 5e-4, 1e-3, 3e-3],
                           value=1e-3, format_func=lambda x: f"{x:.0e}")
-        lstm_epochs   = st.slider("Epochs BiLSTM", 50, 500, 200, 25)
-        lstm_patience = st.slider("Early stopping patience", 10, 80, 30, 5)
-        reg_epochs    = st.slider("Epochs cabeza de regresión", 50, 500, 200, 25)
+        lstm_epochs   = st.slider("Epochs BiLSTM", 30, 300, 120, 10)
+        lstm_patience = st.slider("Early stopping patience", 10, 60, 25, 5)
+        reg_epochs    = st.slider("Epochs cabeza de regresión", 30, 300, 100, 10)
         reg_lr        = st.select_slider("Learning rate (cabeza)",
                           options=[1e-4, 3e-4, 5e-4, 1e-3, 3e-3],
                           value=1e-3, format_func=lambda x: f"{x:.0e}")
         lstm_step_h   = st.slider("Paso autorregresivo (horas)", 1, 168, 24, 1)
-        lstm_max_steps= st.slider("Pasos máximos autorregresivos", 10, 300, 120, 10)
+        lstm_max_steps= st.slider("Pasos máximos autorregresivos", 10, 200, 80, 10)
         lstm_stop_thr = st.slider("Umbral de parada 1/v (falla)", 0.01, 10.0, 0.5, 0.01)
+        # n_layers no aplica en la impl numpy (siempre 1 celda LSTM por dirección)
+        lstm_layers   = 1
 
     st.markdown("---")
     input_mode = st.radio("Fuente de entrada",
