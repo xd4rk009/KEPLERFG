@@ -1,3 +1,4 @@
+
 """
 ANÁLISIS ÓPTICO DE VÍDEO TÉRMICO — Streamlit v5
 Cambios respecto a v4:
@@ -847,13 +848,12 @@ def train_fukuzono(inv_v_arr, disp_arr, vel_arr, t_days_arr,
                    lr=1e-3, epochs=200, patience=30,
                    reg_epochs=150, reg_lr=1e-3,
                    step_hours=24.0, max_steps=120,
-                   stop_threshold=0.5,
                    progress_cb=None):
     """
     Entrena FukuzonoLSTM numpy puro (BiLSTM + SelfAttention + cabeza regresión).
     Fase 1: entrenamiento end-to-end.
     Fase 2: fine-tune solo cabeza (BiLSTM congelado).
-    Fase 3: loop autorregresivo hasta 1/v ≤ stop_threshold.
+    Fase 3: loop autorregresivo hasta 1/v = 0 (falla) o max_steps.
     """
     rng = np.random.RandomState(42)
     n = len(inv_v_arr)
@@ -1021,7 +1021,7 @@ def train_fukuzono(inv_v_arr, disp_arr, vel_arr, t_days_arr,
         buf_inv_v.append(next_inv_v); buf_vel.append(next_vel)
         buf_disp.append(next_disp);   buf_t.append(next_t)
 
-        if next_inv_v <= stop_threshold:
+        if next_inv_v <= 0.0:   # falla real: 1/v cruza el eje 0
             break
 
     if progress_cb: progress_cb(1.0)
@@ -1105,54 +1105,72 @@ def compute_inv_vel(disp, timestamps):
     return ts_iv, iv
 
 
-def build_fukuzono_figure(ts_real, inv_v_real, pred_train,
-                           future_t_off, future_inv_v,
+def build_fukuzono_figure(x_real, inv_v_real, pred_train,
+                           future_x_off, future_inv_v,
                            metrics, history_loss,
-                           stop_threshold=0.5):
-    """Figura principal Fukuzono: histórico + ajuste + proyección autorregresiva."""
-    ts_fut = ts_real[-1] + future_t_off
-    rmse   = metrics["RMSE"]
+                           x_labels_real=None, x_labels_fut=None,
+                           x_title="Tiempo"):
+    """
+    Figura principal Fukuzono.
+    x_real        : array numérico para el eje X del histórico
+    x_labels_real : etiquetas de texto opcionales (fechas ISO o 'Frame N')
+    future_x_off  : offsets numéricos desde x_real[-1] para la proyección
+    x_labels_fut  : etiquetas de texto opcionales para la proyección
+    La línea roja de falla SOLO aparece si la proyección cruza 1/v = 0.
+    """
+    rmse = metrics["RMSE"]
+
+    # Eje X: usar etiquetas si las hay, si no usar valores numéricos
+    x_r   = x_labels_real if x_labels_real is not None else x_real
+    x_fut = x_labels_fut  if x_labels_fut  is not None else (x_real[-1] + future_x_off)
 
     fig = make_subplots(rows=1, cols=2, column_widths=[0.68, 0.32],
                         subplot_titles=["Serie real + proyección autorregresiva FukuzonoLSTM",
                                         "Curva de pérdida"])
 
     # Serie real
-    fig.add_trace(go.Scatter(x=ts_real, y=inv_v_real, mode="lines",
+    fig.add_trace(go.Scatter(x=x_r, y=inv_v_real, mode="lines",
         name="1/v real", line=dict(color=PINK, width=2.2)), row=1, col=1)
 
     # Reconstrucción train
     vm = ~np.isnan(pred_train)
     if vm.any():
-        fig.add_trace(go.Scatter(x=ts_real[vm], y=pred_train[vm], mode="lines",
+        fig.add_trace(go.Scatter(x=x_r[vm] if x_labels_real is None else np.array(x_r)[vm],
+            y=pred_train[vm], mode="lines",
             name="Ajuste LSTM (train)", line=dict(color=YELLOW, width=1.8, dash="dash")),
             row=1, col=1)
 
-    # Banda ±RMSE
+    # Proyección + banda
     if len(future_inv_v) > 0:
         fig.add_trace(go.Scatter(
-            x=np.concatenate([ts_fut, ts_fut[::-1]]),
+            x=np.concatenate([x_fut, x_fut[::-1]]) if not isinstance(x_fut[0], str)
+              else list(x_fut) + list(x_fut[::-1]),
             y=np.concatenate([future_inv_v + rmse, (future_inv_v - rmse)[::-1]]),
             fill="toself", fillcolor="rgba(63,185,80,0.15)",
             line=dict(color="rgba(0,0,0,0)"),
             name=f"±1 RMSE ({rmse:.3f})", showlegend=True), row=1, col=1)
 
-        # Proyección futura
-        fig.add_trace(go.Scatter(x=ts_fut, y=future_inv_v, mode="lines+markers",
+        fig.add_trace(go.Scatter(x=x_fut, y=future_inv_v, mode="lines+markers",
             name="Proyección autorregresiva",
             line=dict(color=GREEN, width=2.2), marker=dict(size=5)), row=1, col=1)
 
-        # Punto de falla proyectado
-        fig.add_vline(x=float(ts_fut[-1]), line_dash="dot", line_color="red",
-                      annotation_text=f"Falla proyectada<br>t={ts_fut[-1]:.1f}s",
-                      annotation_font_color="red", row=1, col=1)
+        # Línea roja SOLO si cruza 0 (falla real)
+        crossed_zero = future_inv_v[-1] <= 0.0
+        if crossed_zero:
+            fig.add_vline(x=x_fut[-1] if not isinstance(x_fut[-1], str) else x_fut[-1],
+                          line_dash="dot", line_color="red",
+                          annotation_text="FALLA (1/v = 0)",
+                          annotation_font_color="red", row=1, col=1)
 
-    # Línea de corte
-    fig.add_hline(y=stop_threshold, line_dash="dot", line_color=BORDER,
-                  annotation_text=f"umbral={stop_threshold}", row=1, col=1)
+    # Línea Y=0 (referencia de falla)
+    fig.add_hline(y=0, line_dash="dot", line_color="red",
+                  line_width=1.5, opacity=0.6,
+                  annotation_text="Falla (1/v = 0)",
+                  annotation_font_color="red", row=1, col=1)
 
     # Separación histórico / proyección
-    fig.add_vline(x=float(ts_real[-1]), line_dash="dot", line_color=BORDER, row=1, col=1)
+    fig.add_vline(x=x_r[-1] if not isinstance(x_r[-1], str) else x_r[-1],
+                  line_dash="dot", line_color=BORDER, row=1, col=1)
 
     # Curva de pérdida
     fig.add_trace(go.Scatter(y=history_loss, mode="lines", name="Loss",
@@ -1162,7 +1180,7 @@ def build_fukuzono_figure(ts_real, inv_v_real, pred_train,
         title=dict(text="FukuzonoLSTM — Predicción Autorregresiva (1/v → 0)",
                    font=dict(color=CYAN, size=14)), height=440)
     fig.update_yaxes(title_text="1/v", row=1, col=1, gridcolor=BORDER)
-    fig.update_xaxes(title_text="Tiempo (s)", row=1, col=1, gridcolor=BORDER)
+    fig.update_xaxes(title_text=x_title, row=1, col=1, gridcolor=BORDER)
     fig.update_yaxes(title_text="Loss (log)", type="log", row=1, col=2, gridcolor=BORDER)
     fig.update_xaxes(title_text="Epoch", row=1, col=2, gridcolor=BORDER)
     for ann in fig["layout"]["annotations"]:
@@ -1517,9 +1535,8 @@ def main():
                           value=1e-3, format_func=lambda x: f"{x:.0e}")
         lstm_step_h   = st.slider("Paso autorregresivo (horas)", 1, 168, 24, 1)
         lstm_max_steps= st.slider("Pasos máximos autorregresivos", 10, 200, 80, 10)
-        lstm_stop_thr = st.slider("Umbral de parada 1/v (falla)", 0.01, 10.0, 0.5, 0.01)
-        # n_layers no aplica en la impl numpy (siempre 1 celda LSTM por dirección)
-        lstm_layers   = 1
+        # Falla = cuando 1/v cruza 0 (no hay umbral arbitrario)
+        lstm_layers   = 1  # impl numpy: 1 capa BiLSTM
 
     st.markdown("---")
     input_mode = st.radio("Fuente de entrada",
@@ -1758,7 +1775,6 @@ def main():
                         lr=lstm_lr, epochs=lstm_epochs, patience=lstm_patience,
                         reg_epochs=reg_epochs, reg_lr=reg_lr,
                         step_hours=lstm_step_h, max_steps=lstm_max_steps,
-                        stop_threshold=lstm_stop_thr,
                         progress_cb=lambda f, _p=prog, _l=lbl: _p.progress(f, text=f"{_l} — {f*100:.0f}%"))
                     prog.progress(1.0, text=f"{lbl} — completado ✓")
                     results[lbl] = (pred_tr, fut_inv, fut_t_off, metr, hloss, ts_iv_i[:_n], inv_i_)
@@ -1774,17 +1790,22 @@ def main():
                 pred_tr, fut_inv, fut_t_off, metr, hloss, ts_s, iv_s = entry
                 st.markdown(f"#### {lbl}")
 
-                # Convertir offsets de días a segundos para el eje X
-                fut_t_sec = ts_s[-1] + fut_t_off * 86400.0
-
+                # Eje X: fechas reales del archivo Excel
+                _s_meta  = series_list[res_idx]
+                _n_avail = min(_n, len(_s_meta["dates"]))
+                _dates_r = _s_meta["dates"].iloc[:_n_avail]
+                x_lbl_real = np.array(_dates_r.dt.strftime("%Y-%m-%d %H:%M").tolist())
+                # Fechas proyectadas
+                _last_d  = _s_meta["dates"].iloc[_n_avail - 1]
+                _fut_d   = [_last_d + pd.Timedelta(days=float(d)) for d in fut_t_off]
+                x_lbl_fut = np.array([d.strftime("%Y-%m-%d %H:%M") for d in _fut_d])
                 fig_main = build_fukuzono_figure(
-                    ts_s, iv_s, pred_tr,
-                    fut_t_sec - ts_s[-1],   # offsets en segundos
-                    fut_inv, metr, hloss, lstm_stop_thr)
-                # Ajustar x para que sea absoluto
-                fig_main = build_fukuzono_figure(
-                    ts_s, iv_s, pred_tr,
-                    fut_t_off * 86400.0, fut_inv, metr, hloss, lstm_stop_thr)
+                    np.arange(_n_avail), iv_s[:_n_avail], pred_tr,
+                    np.arange(len(fut_inv)),
+                    fut_inv, metr, hloss,
+                    x_labels_real=x_lbl_real,
+                    x_labels_fut=x_lbl_fut,
+                    x_title="Fecha")
 
                 st.plotly_chart(fig_main, use_container_width=True,
                                 key=f"excel_fuku_{res_idx}_{lbl[:20]}")
@@ -1796,11 +1817,11 @@ def main():
                 mc4.metric("R²",   f"{metr['R2']:.4f}")
 
                 if len(fut_inv) > 0:
-                    t_falla_s = ts_s[-1] + fut_t_off[-1] * 86400.0
-                    st.info(
-                        f"**Falla proyectada:** offset {fut_t_off[-1]:.1f} días desde el último dato  |  "
-                        f"Pasos autorregresivos: {len(fut_inv)}  |  "
-                        f"1/v final: {fut_inv[-1]:.4f}")
+                    _crossed = fut_inv[-1] <= 0.0
+                    _msg = ("⚠️ **FALLA PROYECTADA** — 1/v cruza 0" if _crossed
+                            else f"Proyección incompleta — 1/v final: {fut_inv[-1]:.4f} (no alcanzó 0 en {len(fut_inv)} pasos)")
+                    _fecha_falla = _fut_d[-1].strftime("%Y-%m-%d %H:%M") if _crossed else "—"
+                    st.info(f"{_msg}  |  Fecha proyectada: {_fecha_falla}  |  Pasos: {len(fut_inv)}")
 
                 with st.expander(f"Detalle modelo y pronóstico — {lbl}"):
                     st.markdown(f"""
@@ -2228,7 +2249,6 @@ def main():
                     lr=lstm_lr, epochs=lstm_epochs, patience=lstm_patience,
                     reg_epochs=reg_epochs, reg_lr=reg_lr,
                     step_hours=lstm_step_h, max_steps=lstm_max_steps,
-                    stop_threshold=lstm_stop_thr,
                     progress_cb=lambda f: prog_bar.progress(f, text=f"Entrenando... {f*100:.0f}%"))
 
                 prog_bar.progress(1.0, text="¡Completado!")
@@ -2244,9 +2264,17 @@ def main():
     if lr_res:
         pred_tr, fut_inv, fut_t_off, metr, hloss, ts_lstm, iv_lstm = lr_res
 
+        # Eje X video/imágenes: número de frame (1, 2, 3, ...)
+        _n_real = len(ts_lstm)
+        _x_frames_real = np.array([f"Frame {i+1}" for i in range(_n_real)])
+        _x_frames_fut  = np.array([f"Frame {_n_real + i + 1}" for i in range(len(fut_inv))])
         fig_main = build_fukuzono_figure(
-            ts_lstm, iv_lstm, pred_tr,
-            fut_t_off * 86400.0, fut_inv, metr, hloss, lstm_stop_thr)
+            np.arange(_n_real), iv_lstm, pred_tr,
+            np.arange(len(fut_inv)),
+            fut_inv, metr, hloss,
+            x_labels_real=_x_frames_real,
+            x_labels_fut=_x_frames_fut,
+            x_title="Frame")
         st.plotly_chart(fig_main, use_container_width=True, key="vid_fuku_main")
 
         mc1, mc2, mc3, mc4 = st.columns(4)
@@ -2256,10 +2284,10 @@ def main():
         mc4.metric("R²",   f"{metr['R2']:.4f}")
 
         if len(fut_inv) > 0:
-            st.info(
-                f"**Falla proyectada:** offset {fut_t_off[-1]*24:.1f} horas desde el último dato  |  "
-                f"Pasos autorregresivos: {len(fut_inv)}  |  "
-                f"1/v final: {fut_inv[-1]:.5f}")
+            _v_crossed = fut_inv[-1] <= 0.0
+            _v_msg = ("⚠️ **FALLA PROYECTADA** — 1/v cruza 0" if _v_crossed
+                      else f"Proyección sin cruzar 0 — 1/v final: {fut_inv[-1]:.5f} (máx {len(fut_inv)} pasos)")
+            st.info(f"{_v_msg}  |  Frame proyectado: {_n_real + len(fut_inv)}")
 
         with st.expander("Detalles del modelo y pronóstico"):
             import pandas as pd
