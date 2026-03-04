@@ -866,27 +866,57 @@ def train_fukuzono(inv_v_arr, disp_arr, vel_arr, t_days_arr,
                    progress_cb=None):
     """
     Entrena FukuzonoLSTM numpy puro (BiLSTM + SelfAttention + cabeza regresión).
-    Fase 1: entrenamiento end-to-end.
-    Fase 2: fine-tune solo cabeza (BiLSTM congelado).
-    Fase 3: loop autorregresivo hasta 1/v = 0 (falla) o max_steps.
+
+    Mejoras v2:
+    - Entrenamiento en log-space: target = log1p(inv_v) → rango compacto,
+      gradientes estables incluso con picos grandes.
+    - Target suavizado con media móvil antes del entrenamiento para que el
+      modelo aprenda la TENDENCIA, no los picos individuales.
+    - Predicción reconvertida con expm1() al espacio original.
+    - Loop autorregresivo opera también en log-space → más estable.
+
+    Fases:
+    1. Entrenamiento end-to-end BiLSTM.
+    2. Fine-tune solo cabeza (BiLSTM congelado).
+    3. Loop autorregresivo hasta 1/v = 0 (falla) o max_steps.
     """
     rng = np.random.RandomState(42)
     n = len(inv_v_arr)
-    feats_all = engineer_features_fuku(inv_v_arr, disp_arr, vel_arr, t_days_arr)
+
+    # ── Pre-procesamiento: log-space + suavizado de target ───────────────────
+    # Winsorize adicional al p90 para eliminar picos extremos en entrenamiento
+    _finite = inv_v_arr[np.isfinite(inv_v_arr) & (inv_v_arr > 0)]
+    _p90 = float(np.percentile(_finite, 90)) if len(_finite) > 1 else float(inv_v_arr.max())
+    inv_v_clean = np.clip(inv_v_arr.astype(float), 0.0, _p90)
+
+    # Suavizado ligero de la señal de entrenamiento (media móvil 3 puntos)
+    _sw = min(3, max(1, n // 10))
+    if _sw >= 2:
+        pad = np.pad(inv_v_clean, (_sw - 1, 0), mode='edge')
+        wins_smooth = np.lib.stride_tricks.sliding_window_view(pad, _sw)
+        inv_v_smooth = wins_smooth.mean(axis=1)
+    else:
+        inv_v_smooth = inv_v_clean.copy()
+
+    # Transformar a log-space
+    log_inv_v = np.log1p(inv_v_smooth)  # objetivo de entrenamiento (suavizado)
+    log_inv_v_raw = np.log1p(inv_v_clean)  # para métricas finales
+
+    feats_all = engineer_features_fuku(inv_v_clean, disp_arr, vel_arr, t_days_arr)
     seq_len   = min(seq_len, max(3, n - 2))
 
     X_list, y_list = [], []
     for i in range(n - seq_len):
         X_list.append(feats_all[i: i + seq_len].astype(np.float64))
-        y_list.append(float(inv_v_arr[i + seq_len]))
+        y_list.append(float(log_inv_v[i + seq_len]))   # target en log-space
 
     if len(X_list) < 4:
         raise ValueError(f"Serie demasiado corta ({n} puntos). Necesitas al menos {seq_len + 4}.")
 
     X_all = np.array(X_list)
-    y_all = np.array(y_list)
+    y_all = np.array(y_list)            # ya en log-space, rango compacto
     y_mean = y_all.mean(); y_std = y_all.std() + 1e-8
-    y_sc   = (y_all - y_mean) / y_std
+    y_sc   = (y_all - y_mean) / y_std   # normalización z-score
 
     split  = max(2, int(len(X_all) * 0.85))
     X_tr, y_tr = X_all[:split], y_sc[:split]
@@ -920,7 +950,6 @@ def train_fukuzono(inv_v_arr, disp_arr, vel_arr, t_days_arr,
 
         if val_loss < best_val:
             best_val = val_loss; wait = 0
-            # snapshot ligero: guardar parámetros del head únicamente
             best_snap = {
                 "d1W": model.d1.W.copy(), "d1b": model.d1.b.copy(),
                 "d2W": model.d2.W.copy(), "d2b": model.d2.b.copy(),
@@ -933,15 +962,13 @@ def train_fukuzono(inv_v_arr, disp_arr, vel_arr, t_days_arr,
         if progress_cb:
             progress_cb((ep + 1) / total_ep * 0.55)
 
-    # ── Fase 2: fine-tune solo cabeza (no backprop al BiLSTM) ───────────────
-    # Pre-calcular embeddings (ctx) con el BiLSTM congelado
+    # ── Fase 2: fine-tune solo cabeza ────────────────────────────────────────
     ctxs_tr = []
     for i in range(len(X_tr)):
         _, cache_i = model.forward(X_tr[i])
-        ctxs_tr.append(cache_i[3].copy())  # ctx es cache[3]
+        ctxs_tr.append(cache_i[3].copy())
     ctxs_tr = np.array(ctxs_tr)
 
-    # Cabeza separada para fine-tune
     rng2 = np.random.RandomState(123)
     ctx_dim = hidden_dim * (2 if bidirectional else 1)
     head_d1 = _Dense(ctx_dim, 64, rng2, reg_lr, 1e-4, act="gelu")
@@ -950,7 +977,6 @@ def train_fukuzono(inv_v_arr, disp_arr, vel_arr, t_days_arr,
     best_val2 = np.inf; best_snap2 = None; wait2 = 0
     sched2 = max(10, reg_epochs // 5); clr2 = reg_lr
 
-    # Pre-calc val ctxs
     ctxs_val = []
     for j in range(len(X_val)):
         _, cache_j = model.forward(X_val[j])
@@ -998,19 +1024,24 @@ def train_fukuzono(inv_v_arr, disp_arr, vel_arr, t_days_arr,
         head_d2.W = best_snap2["d2W"]; head_d2.b = best_snap2["d2b"]
 
     def _predict_one(x_seq):
+        """Predice en log-space y reconvierte a espacio original."""
         _, cache = model.forward(x_seq)
         ctx = cache[3]
         h1  = head_d1.forward(ctx)
-        return float(head_d2.forward(h1)[0])
+        log_pred = float(head_d2.forward(h1)[0])
+        # Desnormalizar
+        log_val = log_pred * y_std + y_mean
+        # Reconvertir a espacio original: expm1(log1p(x)) = x
+        return float(np.expm1(max(0.0, log_val)))
 
     # ── Predicciones sobre datos reales ──────────────────────────────────────
     pred_train = np.full(n, np.nan)
     for i in range(len(X_all)):
-        pv = _predict_one(X_all[i]) * y_std + y_mean
+        pv = _predict_one(X_all[i])
         pred_train[i + seq_len] = max(0.0, pv)
 
     # ── Loop autorregresivo ──────────────────────────────────────────────────
-    buf_inv_v = list(inv_v_arr.astype(float))
+    buf_inv_v = list(inv_v_clean.astype(float))
     buf_disp  = list(disp_arr.astype(float))
     buf_vel   = list(vel_arr.astype(float))
     buf_t     = list(t_days_arr.astype(float))
@@ -1018,17 +1049,24 @@ def train_fukuzono(inv_v_arr, disp_arr, vel_arr, t_days_arr,
     future_inv_v = []; future_t_off = []
     step_days = step_hours / 24.0
 
+    # Trend estimado de los últimos puntos para validar dirección
+    _last_k = min(10, n // 4)
+    _trend_slope = 0.0
+    if _last_k >= 3:
+        _xt = np.arange(_last_k)
+        _yt = inv_v_smooth[-_last_k:]
+        _trend_slope = float(np.polyfit(_xt, _yt, 1)[0])
+
     for step in range(max_steps):
         feats_buf = engineer_features_fuku(
             np.array(buf_inv_v), np.array(buf_disp),
             np.array(buf_vel),   np.array(buf_t))
         win = feats_buf[-seq_len:].astype(np.float64)
 
-        pred_sc   = _predict_one(win)
-        next_inv_v = max(0.0, pred_sc * y_std + y_mean)
-        next_t    = buf_t[-1] + step_days
-        next_vel  = 1.0 / (next_inv_v + 1e-8)
-        next_disp = buf_disp[-1] + next_vel * step_days
+        next_inv_v = max(0.0, _predict_one(win))
+        next_t     = buf_t[-1] + step_days
+        next_vel   = 1.0 / (next_inv_v + 1e-8)
+        next_disp  = buf_disp[-1] + next_vel * step_days
 
         future_inv_v.append(next_inv_v)
         future_t_off.append(next_t - t_days_arr[-1])
@@ -1036,14 +1074,14 @@ def train_fukuzono(inv_v_arr, disp_arr, vel_arr, t_days_arr,
         buf_inv_v.append(next_inv_v); buf_vel.append(next_vel)
         buf_disp.append(next_disp);   buf_t.append(next_t)
 
-        if next_inv_v <= 0.0:   # falla real: 1/v cruza el eje 0
+        if next_inv_v <= 0.0:
             break
 
     if progress_cb: progress_cb(1.0)
 
-    # Métricas
+    # ── Métricas en espacio original (sobre inv_v_clean, sin suavizado) ───────
     vm = ~np.isnan(pred_train)
-    rs = inv_v_arr[vm]; ps = pred_train[vm]
+    rs = inv_v_clean[vm]; ps = pred_train[vm]
     mae  = float(np.mean(np.abs(rs - ps)))
     rmse = float(np.sqrt(np.mean((rs - ps) ** 2)))
     mape = float(np.mean(np.abs((rs - ps) / (np.abs(rs) + 1e-8))) * 100)
@@ -1055,7 +1093,8 @@ def train_fukuzono(inv_v_arr, disp_arr, vel_arr, t_days_arr,
                    epochs_run=len(history_loss),
                    best_val_loss=float(best_val2),
                    seq_len=seq_len, hidden_dim=hidden_dim,
-                   n_layers=1, bidirectional=bidirectional)
+                   n_layers=1, bidirectional=bidirectional,
+                   trend_slope=float(_trend_slope))
 
     return pred_train, np.array(future_inv_v), np.array(future_t_off), metrics, history_loss
 
@@ -1110,14 +1149,48 @@ def build_inverse_velocity_figure(ts_iv, inv_vel_raw, inv_vel_proc):
     return fig
 
 
-def compute_inv_vel(disp, timestamps):
-    d      = np.abs(np.diff(disp.astype(np.float64)))
-    iv     = 1.0 / (d + 1e-9)
-    finite = iv[np.isfinite(iv)]
-    p99    = float(np.percentile(finite, 99)) if len(finite) > 1 else float(iv.max())
-    iv     = np.clip(iv, 0.0, p99)
-    ts_iv  = np.array(timestamps[1:], dtype=np.float64)
-    return ts_iv, iv
+def compute_inv_vel(disp, timestamps, vel_window=3, cap_percentile=95):
+    """
+    Calcula la velocidad inversa (1/v) de forma robusta.
+
+    Mejoras respecto a la versión anterior:
+    - Velocidad calculada con diferencias centrales sobre 'vel_window' pasos
+      (en lugar de diff crudo frame-a-frame), lo que reduce picos espurios
+      por periodos casi estacionarios.
+    - Cap al percentil 'cap_percentile' (default p95, antes p99) para reducir
+      el dominio de spikes en el entrenamiento del LSTM.
+    - Retorna además la velocidad bruta (para visualización).
+    """
+    disp_f = disp.astype(np.float64)
+    ts_f   = np.array(timestamps, dtype=np.float64)
+    n      = len(disp_f)
+    w      = max(1, min(vel_window, n // 4))
+
+    vel = np.full(n, np.nan)
+    # Diferencias centrales con ventana w
+    for i in range(w, n - w):
+        dt_w = ts_f[i + w] - ts_f[i - w]
+        if dt_w > 0:
+            vel[i] = (disp_f[i + w] - disp_f[i - w]) / dt_w
+    # Bordes: diferencia simple
+    for i in range(w):
+        if i + 1 < n and ts_f[i + 1] > ts_f[i]:
+            vel[i] = (disp_f[i + 1] - disp_f[i]) / (ts_f[i + 1] - ts_f[i])
+    for i in range(n - w, n):
+        if i > 0 and ts_f[i] > ts_f[i - 1]:
+            vel[i] = (disp_f[i] - disp_f[i - 1]) / (ts_f[i] - ts_f[i - 1])
+    # Rellenar NaN residuales con forward-fill
+    for i in range(1, n):
+        if np.isnan(vel[i]):
+            vel[i] = vel[i - 1]
+    vel = np.nan_to_num(vel, nan=0.0)
+
+    iv = 1.0 / (np.abs(vel) + 1e-9)
+    finite = iv[np.isfinite(iv) & (iv > 0)]
+    cap = float(np.percentile(finite, cap_percentile)) if len(finite) > 1 else float(np.nanmax(iv))
+    iv  = np.clip(iv, 0.0, cap)
+
+    return ts_f, iv
 
 
 def build_fukuzono_figure(x_real, inv_v_real, pred_train,
@@ -1602,7 +1675,10 @@ def main():
             f"{out_active_sb}|{out_order_sb if out_active_sb else ''}|"
             f"{out_method_sb if out_active_sb else ''}|"
             f"{out_iqr_k_sb if out_active_sb else ''}|"
-            f"{out_zscore_sb if out_active_sb else ''}"
+            f"{out_zscore_sb if out_active_sb else ''}|"
+            f"lstm:{lstm_seq_len}:{lstm_hidden}:{lstm_dropout}:{lstm_bidir}:"
+            f"{lstm_lr}:{lstm_epochs}:{lstm_patience}:{reg_epochs}:{reg_lr}:"
+            f"{lstm_step_h}:{lstm_max_steps}"
         )
 
         if st.session_state["excel_cache_key"] != excel_cache_key:
@@ -1783,9 +1859,10 @@ def main():
                 prog = st.progress(0, text=f"{lbl} — entrenando...")
 
                 # Construir vel a partir de inv_v (1/inv_v)
-                vel_i  = 1.0 / (inv_proc_i + 1e-8)
-                disp_i = disp_proc_i[1:]  # alinear con inv_v (len-1)
-                t_days_i = ts_iv_i / 86400.0  # convertir segundos a días
+                # compute_inv_vel ahora retorna arrays de la MISMA longitud que la entrada
+                vel_i    = 1.0 / (inv_proc_i + 1e-8)
+                disp_i   = disp_proc_i          # ya alineado (mismo largo que ts_iv_i)
+                t_days_i = ts_iv_i / 86400.0    # convertir segundos a días
 
                 # Alinear todo al mismo tamaño
                 _n = min(len(inv_proc_i), len(disp_i), len(t_days_i))
@@ -1817,7 +1894,11 @@ def main():
         xlr = st.session_state["excel_lstm_results"]
         if xlr:
             for res_idx, (lbl, entry) in enumerate(xlr.items()):
-                # ── FIX: desempaquetar _n desde el tuple almacenado
+                # Defensa: si el cache viene de versión anterior (7 elementos), pedir reentrenar
+                if not isinstance(entry, (tuple, list)) or len(entry) < 8:
+                    st.warning(f"Resultado cacheado de `{lbl}` tiene formato antiguo. "
+                               "Pulsa **Entrenar FukuzonoLSTM** de nuevo para actualizar.")
+                    continue
                 pred_tr, fut_inv, fut_t_off, metr, hloss, ts_s, iv_s, _n_stored = entry
                 st.markdown(f"#### {lbl}")
 
@@ -2131,7 +2212,10 @@ def main():
         f"{out_active_sb}|{out_order_sb if out_active_sb else ''}|"
         f"{out_method_sb if out_active_sb else ''}|"
         f"{out_iqr_k_sb if out_active_sb else ''}|"
-        f"{out_zscore_sb if out_active_sb else ''}"
+        f"{out_zscore_sb if out_active_sb else ''}|"
+        f"lstm:{lstm_seq_len}:{lstm_hidden}:{lstm_dropout}:{lstm_bidir}:"
+        f"{lstm_lr}:{lstm_epochs}:{lstm_patience}:{reg_epochs}:{reg_lr}:"
+        f"{lstm_step_h}:{lstm_max_steps}"
     )
     if st.session_state.get("vid_processing_key") != _vid_proc_key:
         st.session_state["lstm_result"] = None
@@ -2240,11 +2324,11 @@ def main():
 
     with st.expander("📋 Tabla de trazabilidad"):
         import pandas as pd
-        _n_tr = min(len(_ts_iv_raw), len(_iv_raw), len(inv_lstm))
+        _n_tr = min(len(_ts_iv_raw), len(_iv_raw), len(inv_lstm), len(ds_arr[fa:fb]))
         _df_traz = pd.DataFrame({
             "t (s)":            np.round(_ts_iv_raw[:_n_tr], 4),
-            "Desp. Raw (px)":   np.round(ds_arr[fa:fb][1:_n_tr+1], 6),
-            "Desp. Proc. (px)": np.round(seg_for_lstm[1:_n_tr+1], 6),
+            "Desp. Raw (px)":   np.round(ds_arr[fa:fb][:_n_tr], 6),
+            "Desp. Proc. (px)": np.round(seg_for_lstm[:_n_tr], 6),
             "1/v Raw":          np.round(_iv_raw[:_n_tr], 6),
             "1/v Procesada":    np.round(inv_lstm[:_n_tr], 6)})
         st.dataframe(_df_traz, use_container_width=True, hide_index=True)
@@ -2261,9 +2345,9 @@ def main():
         else:
             prog_bar = st.progress(0, text="Entrenando FukuzonoLSTM...")
 
-            # Construir vel, disp y t_days desde la serie de velocidad inversa
-            vel_vid   = 1.0 / (inv_lstm + 1e-8)
-            disp_vid  = seg_for_lstm[1:]   # alinear con inv_lstm (len-1)
+            # compute_inv_vel retorna arrays de la MISMA longitud que la entrada
+            vel_vid    = 1.0 / (inv_lstm + 1e-8)
+            disp_vid   = seg_for_lstm        # mismo largo que inv_lstm
             t_days_vid = ts_iv_lstm / 86400.0
 
             _n = min(len(inv_lstm), len(disp_vid), len(t_days_vid))
@@ -2294,7 +2378,13 @@ def main():
 
     lr_res = st.session_state["lstm_result"]
     if lr_res:
-        pred_tr, fut_inv, fut_t_off, metr, hloss, ts_lstm, iv_lstm = lr_res
+        # Defensa: limpiar si cache es de versión anterior
+        if not isinstance(lr_res, (tuple, list)) or len(lr_res) < 7:
+            st.session_state["lstm_result"] = None
+            st.info("Cache de resultados obsoleto — pulsa **Entrenar FukuzonoLSTM** de nuevo.")
+            lr_res = None
+    if lr_res:
+        pred_tr, fut_inv, fut_t_off, metr, hloss, ts_lstm, iv_lstm = lr_res[:7]
 
         # Eje X video/imágenes: número de frame (1, 2, 3, ...)
         _n_real = len(ts_lstm)
